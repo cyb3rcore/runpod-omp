@@ -31,16 +31,19 @@
  *     - Always records the start time: `state.activeSince = <epoch ms>`.
  *     - When `ctx.hasUI === false` (headless): performs NO `ctx.ui` call and
  *       returns harmlessly.
- *     - When UI is present and `deps.getActiveProfileId(ctx)` resolves a
- *       profile id: starts a status refresher whose FIRST tick fires
- *       immediately and calls `ctx.ui.setStatus(RUNPOD_STATUS_KEY,
- *       await deps.buildStatusText(profileId))` — named profile, no
- *       endpoint/key — then every `intervalMs` (default 60_000). The stop
+ *     - When UI is present: starts a status refresher whose FIRST tick fires
+ *       immediately, then every `intervalMs` (default 60_000). The stop
  *       function is stored on `state.statusRefresherStop`.
- *     - When UI is present but the profile is unknown or non-runpod
- *       (`getActiveProfileId` → `undefined`): performs NO `setStatus` call
- *       and starts NO refresher (a safe "no set" — never guesses and never
- *       leaks).
+ *       - Each tick RE-RESOLVES the active profile via
+ *         `deps.getActiveProfileId(ctx)` — OMP's `ctx.model` is a live
+ *         accessor, so a runpod profile selected after `session_start` binds
+ *         within one interval.
+ *       - When a runpod profile is active the tick calls
+ *         `ctx.ui.setStatus(RUNPOD_STATUS_KEY, await deps.buildStatusText(
+ *         profileId))` — named profile, no endpoint/key.
+ *       - When no runpod profile is active the tick calls
+ *         `ctx.ui.setStatus(RUNPOD_STATUS_KEY, undefined)` — clears, never
+ *         guesses, never leaks.
  *
  *   `session_shutdown(ctx)`:
  *     - Clears LOCAL session state only: `state.activeSince = undefined`,
@@ -275,19 +278,68 @@ describe("session_start", () => {
 		expect(ui.calls[0]!.value).toBe(`Runpod profile: ${PROFILE_ID} · est $1.10/hr`);
 	});
 
-	test("start with an unknown profile id keeps the extension quiet", () => {
+	test("start with no runpod profile clears the status but arms the refresher", async () => {
 		const log = { events: [] as Array<{ event: string; handler: (ctx?: RunpodSessionContext) => void }> };
 		const pi = createMockPi(log);
 		const state = stateFixture(false);
-		// The active model is not a runpod profile (or its id is unknown).
+		// The active model is not a runpod profile (or its id is unknown) yet.
 		registerRunpodLifecycle(pi, state, depsFixture(() => undefined));
 
 		const { ctx, ui } = uiCtx(true);
 		const start = log.events.find((e) => e.event === "session_start");
 		start!.handler(ctx);
+		await flushTicks();
 
 		expect(state.activeSince).toEqual(expect.any(Number));
-		expect(ui.calls).toHaveLength(0);
+		// The refresher is armed regardless of the current profile so a later
+		// model switch can bind.
+		expect(state.statusRefresherStop).toEqual(expect.any(Function));
+		// No profile line is ever written; the tick clears under the pinned key.
+		expect(ui.calls).toEqual([{ key: RUNPOD_STATUS_KEY, value: undefined }]);
+	});
+
+	test("a runpod profile selected after session_start binds on a later tick", async () => {
+		const log = { events: [] as Array<{ event: string; handler: (ctx?: RunpodSessionContext) => void }> };
+		const pi = createMockPi(log);
+		const state = stateFixture(false);
+		const scheduled: Array<() => void> = [];
+		const cleared: unknown[] = [];
+		const setIntervalFn = ((callback: () => void): unknown => {
+			scheduled.push(callback);
+			return scheduled.length;
+		}) as typeof setInterval;
+		const clearIntervalFn = ((id: unknown): void => {
+			cleared.push(id);
+		}) as typeof clearInterval;
+
+		// The active model starts non-runpod, then "switches" to the runpod
+		// profile after start — mirroring OMP's live ctx.model accessor.
+		let active: string | undefined;
+		registerRunpodLifecycle(pi, state, {
+			getActiveProfileId: () => active,
+			buildStatusText: async () => runpodStatusText(PROFILE_ID),
+			refresherOptions: { intervalMs: 1000, setIntervalFn, clearIntervalFn },
+		});
+
+		const { ctx, ui } = uiCtx(true);
+		const start = log.events.find((e) => e.event === "session_start")!;
+		start.handler(ctx);
+		await flushTicks();
+		// Initial tick: no profile yet -> cleared, nothing shown.
+		expect(ui.calls).toEqual([{ key: RUNPOD_STATUS_KEY, value: undefined }]);
+
+		// Model switches to runpod; the next interval tick binds.
+		active = PROFILE_ID;
+		scheduled[0]!();
+		await flushTicks();
+		expect(ui.calls).toHaveLength(2);
+		expect(ui.calls[1]).toEqual({ key: RUNPOD_STATUS_KEY, value: runpodStatusText(PROFILE_ID) });
+
+		// Switching away again clears on the next tick.
+		active = undefined;
+		scheduled[0]!();
+		await flushTicks();
+		expect(ui.calls[2]).toEqual({ key: RUNPOD_STATUS_KEY, value: undefined });
 	});
 
 	test("headless session performs no UI call but still records the start time", () => {
@@ -429,7 +481,7 @@ describe("startStatusRefresher", () => {
 	}
 
 	test("fires immediately, then per interval, and stop halts further ticks", async () => {
-		const writes: string[] = [];
+		const writes: Array<string | undefined> = [];
 		const { scheduled, cleared, setIntervalFn, clearIntervalFn } = fakeInterval();
 
 		const stop = startStatusRefresher({
@@ -455,7 +507,7 @@ describe("startStatusRefresher", () => {
 	});
 
 	test("stop drops an in-flight update", async () => {
-		const writes: string[] = [];
+		const writes: Array<string | undefined> = [];
 		let resolveText!: (text: string) => void;
 		const { cleared, setIntervalFn, clearIntervalFn } = fakeInterval();
 
