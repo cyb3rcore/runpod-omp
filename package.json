@@ -1,0 +1,69 @@
+{
+	"name": "@cyb3rcore/runpod-omp",
+	"version": "0.1.0",
+	"description": "OMP extension adding a native runpod provider: one model per configured Runpod profile, with queue and load-balanced transports.",
+	"type": "module",
+	"license": "MIT",
+	"homepage": "https://github.com/cyb3rcore/runpod-omp#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/cyb3rcore/runpod-omp.git"
+	},
+	"bugs": {
+		"url": "https://github.com/cyb3rcore/runpod-omp/issues"
+	},
+	"keywords": [
+		"omp",
+		"oh-my-pi",
+		"extension",
+		"runpod",
+		"provider"
+	],
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.json",
+		"test": "bun test",
+		"smoke": "bun run scripts/smoke.ts",
+		"verify": "bun test && bun run build && bun run smoke",
+		"prepublishOnly": "bun run verify"
+	},
+	"omp": {
+		"extensions": [
+			"./dist/index.js"
+		]
+	},
+	"dependencies": {
+		"yaml": "^2.8.0"
+	},
+	"peerDependencies": {
+		"@oh-my-pi/pi-coding-agent": "^17.0.5"
+	},
+	"devDependencies": {
+		"@oh-my-pi/pi-coding-agent": "^17.0.5",
+		"@semantic-release/changelog": "^7.0.0",
+		"@semantic-release/commit-analyzer": "^13.0.1",
+		"@semantic-release/git": "^11.0.1",
+		"@semantic-release/github": "^12.0.9",
+		"@semantic-release/npm": "^13.1.5",
+		"@types/bun": "^1.3.0",
+		"semantic-release": "^25.0.9",
+		"typescript": "^5.9.0"
+	},
+	"engines": {
+		"bun": ">=1.3.14"
+	}
+}

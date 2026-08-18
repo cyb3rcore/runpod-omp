@@ -1,0 +1,457 @@
+/**
+ * Contract tests for the default provider stream dispatch (test-first, per
+ * the approved plan).
+ *
+ * These tests fail today because the module they import does not exist yet.
+ * Implement the following contract to make them pass:
+ *
+ * src/provider.ts
+ *   - a focused exported builder `createRunpodStream(profiles, deps)` that
+ *     returns the OMP `streamSimple`-shaped function
+ *     `(model, context, options?) => AssistantMessageEventStream`. It must be
+ *     supplied the injectable functions `deps.executeQueue`,
+ *     `deps.executeLoadBalanced`, and `deps.resolveApiKey`:
+ *       - `executeQueue(profile, request, deps?)` /
+ *         `executeLoadBalanced(profile, request, deps?)` where `deps` carries
+ *         `{ apiKey?: string; signal?: AbortSignal }` — the resolved key and
+ *         the caller's signal forwarded to the transport layer (mirrors
+ *         `TransportDeps.apiKey`/`TransportDeps.signal`);
+ *       - `resolveApiKey(options, profile)` resolving the effective key in
+ *         production precedence (caller key → profile reference → default).
+ *     `createRunpodStream` returns a REAL `AssistantMessageEventStream`
+ *     (from `@oh-my-pi/pi-ai`), never a plain value or a synchronous throw.
+ *
+ * Dispatch contract:
+ *   - selects the profile strictly by `model.id` (own-key lookup only);
+ *   - normalizes `Context` + `SimpleStreamOptions` into a
+ *     `NormalizedRequest` (`model = profile.model.id`, messages mapped to
+ *     system/user/assistant/tool, `stream = profile.request.mode ===
+ *     "stream"`, plus `temperature`/`maxTokens` when the options carry them);
+ *   - routes by `profile.endpointType`: `"queue"` → `executeQueue`,
+ *     `"load-balanced"` → `executeLoadBalanced`;
+ *   - `options.signal` reaches the transport (in the forwarded `deps.signal`);
+ *   - replays the normalized text/usage into valid OMP events and a terminal
+ *     `done` event whose message carries the assistant text and the mapped
+ *     usage (`input`, `output`, `cacheRead`, `cacheWrite`, `totalTokens`),
+ *     stopping with `stopReason: "stop"`.
+ *
+ * Failure contract: unknown `model.id`, a key-resolution failure, and a
+ * transport failure each FAIL the returned stream (via `stream.fail`) with a
+ * redacted `Error` whose message contains `[redacted]` and never the raw
+ * model id, key, or transport error. Failures happen before any dispatch
+ * when they precede it — never a synchronous throw from `createRunpodStream`.
+ *
+ * No real Runpod credentials or network are used: the transports and key
+ * resolver are recording mocks; the stream is consumed through the real
+ * `AssistantMessageEventStream` async-iterator and `result()`.
+ */
+import { describe, expect, test } from "bun:test";
+
+// Named import pins the required stream-builder entry point (link-time
+// failure if the module omits it).
+import { createRunpodStream } from "../src/provider.js";
+import type { Profile } from "../src/profile-schema.js";
+import type {
+	DowngradeRecord,
+	NormalizedRequest,
+	RequestMode,
+	TransportExecutionResult,
+} from "../src/transport/types.js";
+import type {
+	AssistantMessage,
+	AssistantMessageEvent,
+	AssistantMessageEventStream,
+	Context,
+	SimpleStreamOptions,
+} from "@oh-my-pi/pi-ai";
+
+/** Model metadata for the queue profile. */
+const QUEUE_MODEL = {
+	id: "meta-llama/llama-3.3-70b-instruct",
+	name: "Llama 3.3 70B Instruct",
+	contextWindow: 131_072,
+	maxTokens: 8_192,
+	reasoning: false,
+	input: ["text"],
+	supportsTools: true,
+	supportsVision: false,
+};
+
+/** Model metadata for the load-balanced profile. */
+const LB_MODEL = {
+	id: "qwen/qwen3-32b",
+	name: "Qwen3 32B",
+	contextWindow: 262_144,
+	maxTokens: 16_384,
+	reasoning: true,
+	input: ["text", "image"],
+	supportsTools: true,
+	supportsVision: true,
+};
+
+const QUEUE = "queue-profile";
+const LB = "lb-profile";
+
+/** Build a merged queue profile; overrides replace whole fields. */
+function queueProfile(overrides: { mode?: RequestMode } = {}): Profile {
+	return {
+		endpointType: "queue",
+		invokeUrl: "https://api.runpod.ai/v2/ep-queue",
+		model: QUEUE_MODEL,
+		apiKey: { kind: "secret-reference", ref: "env:RUNPOD_API_KEY", redacted: "[redacted]" },
+		request: {
+			mode: overrides.mode ?? "stream",
+			timeoutMs: 300_000,
+			polling: { intervalMs: 1_000, ttlMs: 1_800_000, focusAware: true },
+			queueAdapter: { kind: "openai-shaped" },
+			loadBalancedPath: "/v1/chat/completions",
+		},
+		policy: { maxAttempts: 1, fallbackProfiles: [] },
+	};
+}
+
+/** Build a merged load-balanced profile (direct worker HTTP, no queue). */
+function lbProfile(): Profile {
+	return {
+		endpointType: "load-balanced",
+		invokeUrl: "https://lb.example.com",
+		model: LB_MODEL,
+		apiKey: { kind: "secret-reference", ref: "env:RUNPOD_API_KEY", redacted: "[redacted]" },
+		request: {
+			mode: "stream",
+			timeoutMs: 300_000,
+			polling: { intervalMs: 1_000, ttlMs: 1_800_000, focusAware: true },
+			queueAdapter: { kind: "openai-shaped" },
+			loadBalancedPath: "/v1/chat/completions",
+		},
+		policy: { maxAttempts: 1, fallbackProfiles: [] },
+	};
+}
+
+/** The two profiles keyed by profile name — the map `createRunpodStream` dispatches over. */
+const PROFILES: Record<string, Profile> = { [QUEUE]: queueProfile(), [LB]: lbProfile() };
+
+/** A conversation exercising every normalizeMessage role mapping. */
+const FAKE_CONTEXT = {
+	messages: [
+		{ role: "user", content: "ping" },
+		{ role: "assistant", content: [{ type: "text", text: "pong" }] },
+		{ role: "developer", content: "be concise" },
+		{
+			role: "toolResult",
+			toolCallId: "t1",
+			toolName: "read",
+			isError: false,
+			content: [{ type: "text", text: "file contents" }],
+		},
+	],
+} as unknown as Context;
+
+const signal = new AbortController().signal;
+
+/** Options carrying every field the request normalization and transport forward. */
+const FAKE_OPTIONS = {
+	apiKey: "test-key",
+	temperature: 0.7,
+	maxTokens: 64,
+	signal,
+} as unknown as SimpleStreamOptions;
+
+/** The normalized request every queue test expects. */
+function expectedRequest(modelId: string): NormalizedRequest {
+	return {
+		model: modelId,
+		messages: [
+			{ role: "user", content: "ping" },
+			{ role: "assistant", content: "pong" },
+			{ role: "system", content: "be concise" },
+			{ role: "tool", content: "file contents", name: "read" },
+		],
+		stream: true,
+		temperature: 0.7,
+		maxTokens: 64,
+	};
+}
+
+/** Usage reported by the mocked transport, in transport vocabulary. */
+const STREAM_USAGE = { inputTokens: 10, outputTokens: 5, totalTokens: 15 };
+
+/** A stream-mode transport result: two text chunks plus usage. */
+const STREAM_RESULT: TransportExecutionResult = {
+	events: [
+		{ type: "text", text: "Hello" },
+		{ type: "text", text: " world" },
+		{ type: "usage", usage: STREAM_USAGE },
+	],
+	details: { requestedMode: "stream", actualMode: "stream", downgrades: [] as DowngradeRecord[] },
+};
+
+/** The transport deps the builder forwards to the injected dispatch functions. */
+interface RunpodStreamTransportDeps {
+	apiKey?: string;
+	signal?: AbortSignal;
+}
+
+/** A recorded dispatch into the injected transport. */
+interface RecordedDispatch {
+	method: "queue" | "loadBalanced";
+	profile: Profile;
+	request: NormalizedRequest;
+	deps?: RunpodStreamTransportDeps;
+}
+
+/** A recorded key-resolution call. */
+interface RecordedKeyCall {
+	options: SimpleStreamOptions | undefined;
+	profile: Profile;
+}
+
+/**
+ * Injectable default-stream deps: records every dispatch/key call, returns a
+ * fixed stream result, and lets a test override the queue/LB result or the
+ * key resolver.
+ */
+function makeDeps(
+	overrides: {
+		queue?: () => TransportExecutionResult | Promise<TransportExecutionResult>;
+		loadBalanced?: () => TransportExecutionResult | Promise<TransportExecutionResult>;
+		resolve?: () => string | undefined | Promise<string | undefined>;
+	} = {},
+) {
+	const dispatches: RecordedDispatch[] = [];
+	const keyCalls: RecordedKeyCall[] = [];
+	const RESOLVED_KEY = "resolved-key-9f3a";
+	return {
+		resolvedKey: RESOLVED_KEY,
+		dispatches,
+		keyCalls,
+		deps: {
+			executeQueue(profile: Profile, request: NormalizedRequest, d?: RunpodStreamTransportDeps) {
+				dispatches.push({ method: "queue", profile, request, deps: d });
+				return overrides.queue?.() ?? STREAM_RESULT;
+			},
+			executeLoadBalanced(profile: Profile, request: NormalizedRequest, d?: RunpodStreamTransportDeps) {
+				dispatches.push({ method: "loadBalanced", profile, request, deps: d });
+				return (
+					overrides.loadBalanced?.() ?? {
+						events: [{ type: "text", text: "LB reply" }],
+						details: {
+							requestedMode: "stream",
+							actualMode: "stream",
+							downgrades: [] as DowngradeRecord[],
+						},
+					}
+				);
+			},
+			resolveApiKey(options: SimpleStreamOptions | undefined, profile: Profile) {
+				keyCalls.push({ options, profile });
+				return overrides.resolve?.() ?? RESOLVED_KEY;
+			},
+		},
+	};
+}
+
+/** Consume a real AssistantMessageEventStream end-to-end and capture every event. */
+async function collect(
+	stream: AssistantMessageEventStream,
+): Promise<AssistantMessageEvent[]> {
+	const events: AssistantMessageEvent[] = [];
+	for await (const event of stream) {
+		events.push(event);
+	}
+	return events;
+}
+
+/** Await `stream.result()` and return the rejection, or throw on success. */
+async function resultError(stream: AssistantMessageEventStream): Promise<unknown> {
+	try {
+		await stream.result();
+	} catch (error) {
+		return error;
+	}
+	throw new Error("expected the stream result to reject, but it resolved");
+}
+
+/** A minimal model id — the only field the dispatcher may read. */
+function modelFor(profileName: string): { id: string } {
+	return { id: profileName };
+}
+
+describe("createRunpodStream dispatch", () => {
+	test("dispatches a queue profile to executeQueue with the normalized request", async () => {
+		const mk = makeDeps();
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		const profile = PROFILES[QUEUE]!;
+		await stream.result();
+
+		expect(mk.keyCalls).toHaveLength(1);
+		expect(mk.keyCalls[0]!.options).toBe(FAKE_OPTIONS);
+		expect(mk.keyCalls[0]!.profile).toBe(profile);
+
+		expect(mk.dispatches).toHaveLength(1);
+		const d = mk.dispatches[0]!;
+		expect(d.method).toBe("queue");
+		expect(d.profile).toBe(profile);
+		expect(d.request).toEqual(expectedRequest(QUEUE_MODEL.id));
+	});
+
+	test("dispatches a load-balanced profile to executeLoadBalanced by model id", async () => {
+		const mk = makeDeps();
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(LB), FAKE_CONTEXT, FAKE_OPTIONS);
+		const profile = PROFILES[LB]!;
+		await stream.result();
+
+		expect(mk.keyCalls).toHaveLength(1);
+		expect(mk.keyCalls[0]!.profile).toBe(profile);
+
+		expect(mk.dispatches).toHaveLength(1);
+		const d = mk.dispatches[0]!;
+		expect(d.method).toBe("loadBalanced");
+		expect(d.profile).toBe(profile);
+		expect(d.request.model).toBe(LB_MODEL.id);
+		expect(d.request.stream).toBe(true);
+	});
+
+	test("forwards the resolved key and options.signal to the transport", async () => {
+		const mk = makeDeps();
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		await stream.result();
+
+		const d = mk.dispatches[0]!;
+		expect(d.deps?.apiKey).toBe(mk.resolvedKey);
+		expect(d.deps?.signal).toBe(FAKE_OPTIONS.signal);
+	});
+
+	test("a non-stream profile sets stream:false and still replays its response", async () => {
+		const qp = queueProfile({ mode: "sync" });
+		const mk = makeDeps({
+			queue: () => ({
+				response: {
+					text: "Full reply",
+					usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+					downgrades: [] as DowngradeRecord[],
+				},
+				events: [],
+				details: { requestedMode: "sync", actualMode: "sync", downgrades: [] as DowngradeRecord[] },
+			}),
+		});
+		const stream = createRunpodStream({ [QUEUE]: qp }, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const events = await collect(stream);
+		expect(mk.dispatches[0]!.request.stream).toBe(false);
+
+		const deltas = events.filter(
+			(e): e is Extract<AssistantMessageEvent, { type: "text_delta" }> => e.type === "text_delta",
+		);
+		expect(deltas.map((d) => d.delta)).toEqual(["Full reply"]);
+
+		const done = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
+		)!;
+		expect(done.message.content).toEqual([{ type: "text", text: "Full reply" }]);
+		expect(done.message.usage).toMatchObject({ input: 3, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 5 });
+	});
+});
+
+describe("createRunpodStream event replay", () => {
+	test("replays normalized text and usage into valid OMP events ending in done with stop", async () => {
+		const mk = makeDeps();
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const events = await collect(stream);
+		expect(events.map((e) => e.type)).toEqual([
+			"start",
+			"text_start",
+			"text_delta",
+			"text_end",
+			"text_start",
+			"text_delta",
+			"text_end",
+			"done",
+		]);
+
+		const deltas = events.filter(
+			(e): e is Extract<AssistantMessageEvent, { type: "text_delta" }> => e.type === "text_delta",
+		);
+		expect(deltas.map((d) => d.delta)).toEqual(["Hello", " world"]);
+
+		const starts = events.filter(
+			(e): e is Extract<AssistantMessageEvent, { type: "text_start" }> => e.type === "text_start",
+		);
+		expect(starts.map((s) => s.contentIndex)).toEqual([0, 1]);
+
+		const done = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
+		)!;
+		expect(done.type).toBe("done");
+		expect(done.reason).toBe("stop");
+		expect(done.message.role).toBe("assistant");
+		expect(done.message.stopReason).toBe("stop");
+		expect(done.message.content).toEqual([
+			{ type: "text", text: "Hello" },
+			{ type: "text", text: " world" },
+		]);
+		expect(done.message.usage).toMatchObject({
+			input: 10,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 15,
+		});
+
+		// result() resolves to the same assistant message the done event carried.
+		const result: AssistantMessage = await stream.result();
+		expect(result).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+			usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15 },
+		});
+		expect(result.content).toEqual([
+			{ type: "text", text: "Hello" },
+			{ type: "text", text: " world" },
+		]);
+	});
+});
+
+describe("createRunpodStream failures", () => {
+	test("fails the returned stream with a redacted error for an unknown model id", async () => {
+		const mk = makeDeps();
+		const UNKNOWN = "ghost-profile";
+
+		// The builder returns a failed stream rather than throwing synchronously.
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(UNKNOWN), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const error = await resultError(stream);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("[redacted]");
+		expect((error as Error).message).not.toContain(UNKNOWN);
+		expect(mk.dispatches).toHaveLength(0);
+		expect(mk.keyCalls).toHaveLength(0);
+	});
+
+	test("a key-resolution failure fails the stream with a redacted error and dispatches nothing", async () => {
+		const SECRET = "wipe-the-earth-token-123";
+		const mk = makeDeps({ resolve: () => { throw new Error(`resolve failed: ${SECRET}`); } });
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const error = await resultError(stream);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("[redacted]");
+		expect((error as Error).message).not.toContain(SECRET);
+		expect((error as Error).message).not.toContain("wipe-the-earth-token-123");
+		expect(mk.dispatches).toHaveLength(0);
+	});
+
+	test("a transport rejection fails the stream with a redacted error", async () => {
+		const RAW = "connection refused to runpod worker";
+		const mk = makeDeps({ queue: () => Promise.reject(new Error(RAW)) });
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const error = await resultError(stream);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("[redacted]");
+		expect((error as Error).message).not.toContain(RAW);
+	});
+});
