@@ -131,6 +131,18 @@ export function startStatusRefresher(options: StatusRefresherOptions): () => voi
  * Register the `session_start` / `session_shutdown` hooks backed by `state`
  * and `deps`. Registration itself performs NO UI set, NO status write, NO
  * timer, and NO control/cost action — it only registers handlers.
+ *
+ * STATUS LINE — DISABLED (pending upstream OMP API discussion). The previous
+ * implementation wrote a "Runpod profile: …" hook status, which OMP 17.3.7
+ * renders on its OWN ROW below the status line. The operator wants runpod
+ * information INLINE in the first line between the ▸/◀ triangles, as a status
+ * segment. OMP 17.3.7 has no extension API for that: `SEGMENTS` (in OMP's
+ * status-line/segments.ts) is a closed Record of built-in ids, `ui.setStatus`
+ * renders BELOW the bar, and `ui.setFooter` is a no-op in interactive mode.
+ * Until an extension-inline-segment API is agreed with OMP upstream, the
+ * handlers below touch NO statusline — no rows above or below, so the
+ * operator's default footer stays untouched. Re-enable by uncommenting the
+ * suspended blocks once that API lands.
  */
 export function registerRunpodLifecycle(
 	pi: ExtensionAPI,
@@ -142,39 +154,33 @@ export function registerRunpodLifecycle(
 		state.activeSince = Date.now();
 		if (ctx === undefined) return;
 		if (!ctx.hasUI) return;
-		const ui = ctx.ui;
-		if (ui === undefined) return;
-		// Start the refresher whenever UI is present, then keep it live. Each
-		// tick RE-RESOLVES the active profile from the session context — OMP's
-		// `ctx.model` is a live accessor, so a runpod profile selected after
-		// `session_start` binds within one interval. When no runpod profile is
-		// active the tick returns undefined and the sink clears the status
-		// line (never guesses, never leaks). The refresher's immediate first
-		// tick performs the initial write, and its stop guard prevents an
-		// in-flight update from landing after shutdown clears the status.
-		state.statusRefresherStop?.();
-		state.statusRefresherStop = startStatusRefresher({
-			getText: async (): Promise<string | undefined> => {
-				const profileId = deps.getActiveProfileId(ctx);
-				if (profileId === undefined) {
-					return undefined;
-				}
-				return deps.buildStatusText(profileId);
-			},
-			setStatus: (text) => ui.setStatus(RUNPOD_STATUS_KEY, text),
-			...deps.refresherOptions,
-		});
+
+		// ── suspended statusline (see module doc: disabled pending upstream) ──
+		// const ui = ctx.ui;
+		// if (ui === undefined) return;
+		// state.statusRefresherStop?.();
+		// state.statusRefresherStop = startStatusRefresher({
+		// 	getText: async (): Promise<string | undefined> => {
+		// 		const profileId = deps.getActiveProfileId(ctx);
+		// 		if (profileId === undefined) return undefined;
+		// 		return deps.buildStatusText(profileId);
+		// 	},
+		// 	setStatus: (text) => ui.setStatus(RUNPOD_STATUS_KEY, text),
+		// 	...deps.refresherOptions,
+		// });
+		// ────────────────────────────────────────────────────────────────────
 	};
 
-	const shutdownHandler = (ctx?: RunpodSessionContext): void => {
+	const shutdownHandler = (_ctx?: RunpodSessionContext): void => {
 		// Clear LOCAL session state only — configured profiles are untouched.
 		state.activeSince = undefined;
 		state.defaultProfile = undefined;
 		state.statusRefresherStop?.();
 		state.statusRefresherStop = undefined;
-		if (ctx === undefined) return;
-		if (!ctx.hasUI) return;
-		ctx.ui?.setStatus(RUNPOD_STATUS_KEY, undefined);
+		// Status-line clear suspended with the refresher (see module doc).
+		// if (ctx === undefined) return;
+		// if (!ctx.hasUI) return;
+		// ctx.ui?.setStatus(RUNPOD_STATUS_KEY, undefined);
 	};
 
 	// Structural adapter: the OMP runtime delivers these hooks as

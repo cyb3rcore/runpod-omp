@@ -468,7 +468,7 @@ describe("runpod extension factory", () => {
 		expect(registeredModelIds(config)).toEqual(["primary"]);
 	});
 
-	test("session lifecycle: start sets status from the live estimate and schedules the refresh interval; shutdown stops it and clears the status; headless stays quiet", async () => {
+	test("session lifecycle (statusline disabled): start/shutdown record session state and touch no statusline, fetch, or timer (interactive + headless)", async () => {
 		await installLayout(GLOBAL_DOC, PROJECT_DOC);
 		const log = emptyLog();
 		await (runpodExtension as ExtensionFactory)(createMockPi(log));
@@ -509,16 +509,14 @@ describe("runpod extension factory", () => {
 		};
 
 		// No status may be written during factory evaluation (handlers not yet
-		// invoked). Instrument fetch/timers around the handler invocations: the
-		// interactive session MAY fetch the live estimate and MUST schedule a
-		// 60s refresh interval; shutdown MUST stop it; headless MUST do none.
+		// invoked). Instrument fetch/timers around the handler invocations: with
+		// the statusline DISABLED the handlers must touch none of them.
 		expect(interactiveStatus.size).toBe(0);
 
 		const originalFetch = globalThis.fetch;
 		const originalSetInterval = globalThis.setInterval;
 		const originalClearInterval = globalThis.clearInterval;
 		const timers: unknown[][] = [];
-		const clearedIntervals: unknown[] = [];
 		const network: unknown[][] = [];
 		globalThis.fetch = ((...args: unknown[]) => {
 			network.push(args);
@@ -529,34 +527,21 @@ describe("runpod extension factory", () => {
 			return originalSetInterval(...(args as never[]));
 		}) as typeof setInterval;
 		globalThis.clearInterval = ((id: unknown) => {
-			clearedIntervals.push(id);
 			return originalClearInterval(id as never);
 		}) as typeof clearInterval;
 		try {
-			// Interactive start: names the active profile, never URL/key bytes.
-			// The status write is the refresher's immediate tick, so let it
-			// settle. The estimate cannot resolve an API key in this
-			// environment, so it fails closed BEFORE any network (zero fetch)
-			// and the status degrades to the profile-only line.
+			// Interactive start: records state but performs no statusline write,
+			// no fetch, and schedules no refresh interval.
 			(start!.handler as (ctx: unknown) => unknown)(interactiveCtx);
 			await new Promise((resolve) => setTimeout(resolve, 0));
-			expect(interactiveStatus.get("runpod")).toBe("Runpod profile: shared");
-			expect(interactiveStatus.get("runpod")).not.toContain("ep-global-shared");
-			expect(interactiveStatus.get("runpod")).not.toContain("RUNPOD_API_KEY");
+			expect(interactiveStatus.size).toBe(0);
 			expect(network).toEqual([]);
+			expect(timers).toEqual([]);
 
-			// The 60s refresh interval was scheduled.
-			expect(
-				timers.some(
-					([name, , ms]) => name === "setInterval" && ms === 60_000,
-				),
-			).toBe(true);
-
-			// Interactive shutdown: stops the refresher and clears the status.
+			// Interactive shutdown: still no statusline write.
 			(shutdown!.handler as (ctx: unknown) => unknown)(interactiveCtx);
 			await new Promise((resolve) => setTimeout(resolve, 0));
-			expect(interactiveStatus.get("runpod")).toBeUndefined();
-			expect(clearedIntervals.length).toBeGreaterThan(0);
+			expect(interactiveStatus.size).toBe(0);
 
 			// Headless start: zero UI writes, no new fetch, no new timer.
 			const fetchesBefore = network.length;
