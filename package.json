@@ -1,6 +1,6 @@
 {
 	"name": "@cyb3rcore/runpod-omp",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"description": "OMP extension adding a native runpod provider: one model per configured Runpod profile, with queue and load-balanced transports.",
 	"type": "module",
 	"license": "MIT",

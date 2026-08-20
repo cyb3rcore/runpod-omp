@@ -1,3 +1,16 @@
+## 1.2.0
+
+- **feat:** per-request journal, disabled by default (`c8ad8f5`)
+  Opt-in via RUNPOD_OMP_LOG=<path>: JSONL lifecycle entries per streamSimple
+turn — dispatch (request summary: message/tool counts, maxTokens, mode),
+dispatch-done (duration, text/reasoning/toolcall lengths, usage),
+dispatch-error (message + cause, credentials redacted), replay-done, and
+failed (surfaced error). Journal writes are synchronous, best-effort, and
+never affect the stream.
+
+This is the OMP-side half of the debugging pipeline (plugin journal ↔
+shim request log ↔ llama-server log) for correlating one failing turn.
+
 ## 1.1.0
 
 - **fix:** strip regex pattern/format from forwarded tool schemas (`6a5f96e`)
