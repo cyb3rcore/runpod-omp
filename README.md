@@ -136,7 +136,7 @@ profiles:
       supportsTools: true
       supportsVision: true
     request:
-      mode: sync
+      mode: stream
       loadBalancedPath: /v1/chat/completions
 
   qwen3.8-subs:
@@ -144,26 +144,30 @@ profiles:
     invokeUrl: https://<subs-endpoint>.api.runpod.ai
     apiKey: env:RUNPOD_API_KEY
     model:
-      id: Qwen3.8-27B-UD-Q8_K_XL
-      name: Qwen3.8 27B (Runpod subs)
-      contextWindow: 40960
+      id: Qwen3.8-27B-UD-Q6_K_XL
+      name: Qwen3.8 27B (Runpod subs, Q6)
+      contextWindow: 131072
       maxTokens: 8192
       reasoning: true
       input: [text, image]
       supportsTools: true
       supportsVision: true
     request:
-      mode: sync
+      mode: stream
       loadBalancedPath: /v1/chat/completions
 ```
 
 The server-side concurrency split is enforced by the endpoint, not the profile:
-the main endpoint runs `PARALLEL=1, CTX_SIZE=262144` (one long-carrying slot),
-while the subs endpoint runs `PARALLEL=8, CTX_SIZE=40960, requestCount=8`
-(eight 40 K slots per worker, scaling to a second worker only when all eight are
-busy — a 16-concurrency ceiling). The profile's `contextWindow` must match the
-endpoint's `CTX_SIZE`: KV cache is `slots × ctx`, so raising parallelism
-necessarily caps usable context per slot.
+the main endpoint runs `PARALLEL=1, CTX_SIZE=262144` on the Q8 quant (one
+long-carrying slot), while the subs endpoint runs `PARALLEL=4,
+CTX_SIZE=524288, requestCount=4` on the **Q6 quant** (four 128 K slots per
+worker, scaling to a second worker only when all four are busy — an
+8-concurrency ceiling). The quant differs deliberately: KV cache is
+`slots × ctx`, so on a 48 GB A40 the Q8's ~14.6 GB usable VRAM only fits
+4 × 64 K, while the Q6 (25 GB vs 31.5 GB weights) frees ~20.6 GB and fits
+4 × 128 K — matching `slots × ctx ≤ ~592K` for this model's 34,816 B/token
+hybrid KV. The profile's `contextWindow` must match the endpoint's per-slot
+`CTX_SIZE`.
 
 **Recommended: serve the weights via Runpod's model-cache, not a baked image.**
 Keep the worker image light (runtime + llama.cpp; no model baked), and in the
@@ -174,9 +178,9 @@ quant repo (e.g. `unsloth/Qwen3.8-27B-GGUF`, ~416 GB across 30 files) is a trap 
 mirror just the two files you serve into your own repo so the cache pulls
 `GGUF + mmproj` only. Workers then boot warm from
 `/runpod-volume/huggingface-cache/hub/models--<org>--<name>/snapshots/<hash>/`
-with no per-worker re-download. For a private repo, the profile's `apiKey` is
-unrelated; the endpoint needs the HF token (console gated-model field or
-`HF_TOKEN` endpoint env) with read access to that repo.
+with no per-worker re-download. Private repos are supported — the Model-field
+pull runs under Runpod's own HF access, so the profile's `apiKey` is unrelated
+(no endpoint `HF_TOKEN` is required in this setup).
 
 ### Schema
 
