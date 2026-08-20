@@ -682,6 +682,52 @@ describe("createRunpodStream tool calling", () => {
 		]);
 	});
 
+	test("strips grammar-unsafe pattern/format keywords from forwarded tool schemas", async () => {
+		const mk = makeDeps();
+		const tool = {
+			name: "mcp__runpod_get_capacity",
+			description: "Check GPU capacity",
+			parameters: {
+				type: "object",
+				properties: {
+					cudaVersions: {
+						type: "array",
+						items: { type: "string", pattern: "^\\d{1,2}\\.\\d{1,2}$" },
+					},
+					since: { type: "string", format: "date-time" },
+					limit: { type: "integer", minimum: 1, maximum: 100 },
+				},
+			},
+		};
+		const context = {
+			messages: [{ role: "user", content: "check capacity" }],
+			tools: [tool],
+		} as unknown as Context;
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), context, FAKE_OPTIONS);
+		await stream.result();
+
+		// The regex-ish keywords that break llama.cpp's grammar converter are
+		// gone at every nesting level; structural constraints stay.
+		expect(mk.dispatches[0]!.request.tools).toEqual([
+			{
+				type: "function",
+				function: {
+					name: "mcp__runpod_get_capacity",
+					description: "Check GPU capacity",
+					parameters: {
+						type: "object",
+						properties: {
+							cudaVersions: { type: "array", items: { type: "string" } },
+							since: { type: "string" },
+							limit: { type: "integer", minimum: 1, maximum: 100 },
+						},
+					},
+				},
+			},
+		]);
+	});
+
 	test("round-trips assistant tool calls into wire tool_calls", async () => {
 		const mk = makeDeps();
 		const context = {

@@ -265,18 +265,46 @@ function buildNormalizedRequest(
 	// cannot burn the slot unbounded.
 	request.maxTokens = options?.maxTokens ?? profile.model.maxTokens;
 	// Forward OMP's function-tool catalog so the worker can offer tool
-	// calling; absent when the context carries no tools.
+	// calling; absent when the context carries no tools. Schemas are
+	// sanitized: llama.cpp's JSON-schema→grammar converter passes regex-ish
+	// keywords (`pattern`, `format`) through into the GBNF grammar, whose
+	// parser rejects escapes like `\d` — one such schema fails the whole
+	// request at sampler init. OMP still validates arguments locally against
+	// the original schema, so dropping them on the wire loses no safety.
 	if (context.tools !== undefined && context.tools.length > 0) {
 		request.tools = context.tools.map((tool) => ({
 			type: "function",
 			function: {
 				name: tool.name,
 				description: tool.description,
-				parameters: tool.parameters,
+				parameters: sanitizeToolSchema(tool.parameters),
 			},
 		}));
 	}
 	return request;
+}
+
+/**
+ * Return a deep copy of a JSON-Schema object with grammar-unsafe constraint
+ * keywords (`pattern`, `format`) removed at every level. Anything that is
+ * not a plain object or array passes through unchanged.
+ */
+function sanitizeToolSchema(schema: unknown): unknown {
+	if (Array.isArray(schema)) {
+		return schema.map(sanitizeToolSchema);
+	}
+	if (typeof schema !== "object" || schema === null) {
+		return schema;
+	}
+	const record = schema as Record<string, unknown>;
+	const cleaned: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(record)) {
+		if (key === "pattern" || key === "format") {
+			continue;
+		}
+		cleaned[key] = sanitizeToolSchema(value);
+	}
+	return cleaned;
 }
 
 /**
