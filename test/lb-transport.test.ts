@@ -35,6 +35,7 @@ import { describe, expect, test } from "bun:test";
 // import of a possibly-absent export would fail at load instead of skipping.
 import { executeLoadBalancedTransport } from "../src/transport/load-balanced.js";
 import * as lbTransport from "../src/transport/load-balanced.js";
+import { isRetryableError } from "../src/transport/types.js";
 import type { NormalizedRequest, RequestMode } from "../src/transport/types.js";
 
 /** Model metadata block, matching the approved profile schema. */
@@ -268,6 +269,34 @@ describe("executeLoadBalancedTransport", () => {
 		expect(result.details).not.toHaveProperty("jobId");
 		expect(result.details).not.toHaveProperty("status");
 		expect(result.details).not.toHaveProperty("depth");
+	});
+
+	test("marks HTTP 5xx failures as transient (retryable)", async () => {
+		const { fetchMock } = recordingFetch(() =>
+			jsonResponse({ error: { message: "Bad Gateway" } }, 502),
+		);
+
+		const error = await executeLoadBalancedTransport(lbProfile(), requestFixture(), {
+			fetch: fetchMock,
+		}).catch((caught: unknown) => caught);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("HTTP 502");
+		expect(isRetryableError(error)).toBe(true);
+	});
+
+	test("leaves deterministic HTTP 4xx failures non-retryable", async () => {
+		const { fetchMock } = recordingFetch(() =>
+			jsonResponse({ error: { message: "Bad Request" } }, 400),
+		);
+
+		const error = await executeLoadBalancedTransport(lbProfile(), requestFixture(), {
+			fetch: fetchMock,
+		}).catch((caught: unknown) => caught);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("HTTP 400");
+		expect(isRetryableError(error)).toBe(false);
 	});
 });
 

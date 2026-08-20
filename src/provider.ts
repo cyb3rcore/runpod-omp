@@ -37,6 +37,7 @@ import { resolveProfileApiKey } from "./config.js";
 import type { Profile } from "./profile-schema.js";
 import { executeLoadBalancedTransport } from "./transport/load-balanced.js";
 import { executeQueueTransport } from "./transport/queue.js";
+import { isRetryableError } from "./transport/types.js";
 import type {
 	NormalizedMessage,
 	NormalizedRequest,
@@ -61,6 +62,47 @@ const RUNPOD_PROVIDER_BASE_URL = "https://api.runpod.ai/v2/runpod-omp-placeholde
 
 /** Marker substituted for identity-bearing values in error messages. */
 const REDACTED = "[redacted]";
+
+/** Delay between retry/fallback dispatch attempts, in milliseconds. */
+const RETRY_BACKOFF_MS = 1000;
+
+/** Default async wait used by retry backoff when `deps.sleep` is absent. */
+const defaultSleep = (ms: number): Promise<void> =>
+	new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Wait `ms` for retry backoff, rejecting early when the caller's signal
+ * aborts mid-wait so a cancelled turn never hangs on the backoff.
+ */
+function sleepWithAbort(
+	sleep: (ms: number) => Promise<void>,
+	ms: number,
+	signal: AbortSignal | undefined,
+): Promise<void> {
+	if (signal === undefined) {
+		return sleep(ms);
+	}
+	if (signal.aborted) {
+		return Promise.reject(new Error("runpod provider: dispatch aborted"));
+	}
+	return new Promise<void>((resolve, reject) => {
+		const onAbort = (): void => {
+			signal.removeEventListener("abort", onAbort);
+			reject(new Error("runpod provider: dispatch aborted"));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		void sleep(ms).then(
+			() => {
+				signal.removeEventListener("abort", onAbort);
+				resolve();
+			},
+			(error: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error instanceof Error ? error : new Error(String(error)));
+			},
+		);
+	});
+}
 
 /**
  * Build one registered model per merged profile. Model metadata is copied
@@ -170,9 +212,10 @@ function buildNormalizedRequest(
 	if (options?.temperature !== undefined) {
 		request.temperature = options.temperature;
 	}
-	if (options?.maxTokens !== undefined) {
-		request.maxTokens = options.maxTokens;
-	}
+	// Always bound the generation: the profile's ceiling applies when the
+	// caller does not pass one, so a runaway (or zombie, post-abort) task
+	// cannot burn the slot unbounded.
+	request.maxTokens = options?.maxTokens ?? profile.model.maxTokens;
 	return request;
 }
 
@@ -221,6 +264,8 @@ export interface RunpodStreamDeps {
 		options: SimpleStreamOptions | undefined,
 		profile: Profile,
 	): string | undefined | Promise<string | undefined>;
+	/** Async wait used by retry backoff; defaults to a setTimeout-based sleep. */
+	sleep?: (ms: number) => Promise<void>;
 }
 
 /** Transport deps forwarded from the stream builder. */
@@ -399,22 +444,61 @@ export function createRunpodStream(
 						"runpod provider: unknown model id — no configured Runpod profile matches; run /runpod doctor to inspect the merged profile configuration",
 					);
 				}
-				const request = buildNormalizedRequest(profile, context, options);
 				apiKey = await deps.resolveApiKey(options, profile);
-				const transportDeps: RunpodStreamTransportDeps = {};
+				const baseDeps: RunpodStreamTransportDeps = {};
 				if (apiKey !== undefined) {
-					transportDeps.apiKey = apiKey;
+					baseDeps.apiKey = apiKey;
 				}
 				if (options?.signal !== undefined) {
-					transportDeps.signal = options.signal;
+					baseDeps.signal = options.signal;
 				}
 
-				const result =
-					profile.endpointType === "queue"
-						? await deps.executeQueue(profile, request, transportDeps)
-						: await deps.executeLoadBalanced(profile, request, transportDeps);
+				// Dispatch the primary profile up to `policy.maxAttempts`,
+				// then each named fallback profile once. Only transient
+				// failures (HTTP 5xx, network) retry or fall back — a
+				// deterministic 4xx/shape/job error surfaces immediately, and
+				// aborts/timeouts never retry. A backoff separates attempts.
+				const maxAttempts = Math.max(1, profile.policy.maxAttempts);
+				const fallbacks = profile.policy.fallbackProfiles.filter(
+					(name) => Object.hasOwn(profiles, name) && name !== model.id,
+				);
+				const sleep = deps.sleep ?? defaultSleep;
 
-				replayRunpodStream(stream, result, profile);
+				let dispatched = false;
+				let lastError: unknown;
+				for (let candidateIndex = 0; candidateIndex <= fallbacks.length && !dispatched; candidateIndex++) {
+					const candidate =
+						candidateIndex === 0 ? profile : profiles[fallbacks[candidateIndex - 1]!]!;
+					const attempts = candidateIndex === 0 ? maxAttempts : 1;
+					for (let attempt = 0; attempt < attempts && !dispatched; attempt++) {
+						if (attempt > 0 || candidateIndex > 0) {
+							await sleepWithAbort(sleep, RETRY_BACKOFF_MS, options?.signal);
+						}
+						try {
+							const candidateKey =
+								candidateIndex === 0 ? apiKey : await deps.resolveApiKey(options, candidate);
+							const candidateDeps: RunpodStreamTransportDeps = { ...baseDeps };
+							if (candidateKey !== undefined) {
+								candidateDeps.apiKey = candidateKey;
+							}
+							const request = buildNormalizedRequest(candidate, context, options);
+							const result =
+								candidate.endpointType === "queue"
+									? await deps.executeQueue(candidate, request, candidateDeps)
+									: await deps.executeLoadBalanced(candidate, request, candidateDeps);
+							replayRunpodStream(stream, result, candidate);
+							dispatched = true;
+						} catch (error) {
+							lastError = error;
+							if (!isRetryableError(error)) {
+								throw error;
+							}
+						}
+					}
+				}
+				if (!dispatched) {
+					throw lastError ?? new Error("runpod provider: dispatch failed");
+				}
 			} catch (error) {
 				// Only literal key bytes can be redacted; OMP also permits an
 				// ApiKeyResolver function as options.apiKey, which carries no

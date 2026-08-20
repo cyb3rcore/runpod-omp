@@ -52,6 +52,7 @@ import { describe, expect, test } from "bun:test";
 // failure if the module omits it).
 import { createRunpodStream } from "../src/provider.js";
 import type { Profile } from "../src/profile-schema.js";
+import { markRetryable } from "../src/transport/types.js";
 import type {
 	DowngradeRecord,
 	NormalizedRequest,
@@ -224,11 +225,13 @@ function makeDeps(
 ) {
 	const dispatches: RecordedDispatch[] = [];
 	const keyCalls: RecordedKeyCall[] = [];
+	const sleeps: number[] = [];
 	const RESOLVED_KEY = "resolved-key-9f3a";
 	return {
 		resolvedKey: RESOLVED_KEY,
 		dispatches,
 		keyCalls,
+		sleeps,
 		deps: {
 			executeQueue(profile: Profile, request: NormalizedRequest, d?: RunpodStreamTransportDeps) {
 				dispatches.push({ method: "queue", profile, request, deps: d });
@@ -250,6 +253,12 @@ function makeDeps(
 			resolveApiKey(options: SimpleStreamOptions | undefined, profile: Profile) {
 				keyCalls.push({ options, profile });
 				return overrides.resolve?.() ?? RESOLVED_KEY;
+			},
+			// Instant sleep so retry backoff never slows the tests; every
+			// backoff wait is still recorded for assertions.
+			sleep(ms: number) {
+				sleeps.push(ms);
+				return Promise.resolve();
 			},
 		},
 	};
@@ -540,6 +549,115 @@ describe("createRunpodStream reasoning replay", () => {
 			{ type: "thinking", thinking: "Step one. Step two." },
 			{ type: "text", text: "Answer." },
 		]);
+	});
+});
+
+describe("createRunpodStream retry & fallback", () => {
+	test("retries a transient failure up to policy.maxAttempts, then succeeds", async () => {
+		let failures = 2;
+		const mk = makeDeps({
+			queue: () => {
+				if (failures-- > 0) {
+					return Promise.reject(markRetryable(new Error("Load-balanced request failed: HTTP 502 Bad Gateway")));
+				}
+				return STREAM_RESULT;
+			},
+		});
+		const qp = queueProfile();
+		qp.policy.maxAttempts = 3;
+
+		const stream = createRunpodStream({ [QUEUE]: qp }, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		const events = await collect(stream);
+
+		// Two failed attempts + one success; backoff ran between attempts.
+		expect(mk.dispatches).toHaveLength(3);
+		expect(mk.sleeps).toEqual([1000, 1000]);
+		const done = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
+		)!;
+		expect(done.message.content).toEqual([
+			{ type: "text", text: "Hello" },
+			{ type: "text", text: " world" },
+		]);
+	});
+
+	test("does not retry a deterministic (non-retryable) failure", async () => {
+		const mk = makeDeps({
+			queue: () => Promise.reject(new Error("Load-balanced request failed: HTTP 400 Bad Request")),
+		});
+		const qp = queueProfile();
+		qp.policy.maxAttempts = 3;
+
+		const stream = createRunpodStream({ [QUEUE]: qp }, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		const error = await resultError(stream);
+
+		expect(mk.dispatches).toHaveLength(1);
+		expect(mk.sleeps).toEqual([]);
+		expect((error as Error).message).toContain("HTTP 400");
+	});
+
+	test("the default maxAttempts of 1 means no retry", async () => {
+		const mk = makeDeps({
+			queue: () => Promise.reject(markRetryable(new Error("Load-balanced request failed: HTTP 503"))),
+		});
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		const error = await resultError(stream);
+
+		expect(mk.dispatches).toHaveLength(1);
+		expect(mk.sleeps).toEqual([]);
+		expect((error as Error).message).toContain("HTTP 503");
+	});
+
+	test("falls back to a named profile after the primary exhausts retries", async () => {
+		const mk = makeDeps({
+			queue: () => Promise.reject(markRetryable(new Error("Load-balanced request failed: HTTP 502"))),
+		});
+		const qp = queueProfile();
+		qp.policy.fallbackProfiles = [LB];
+		const profiles: Record<string, Profile> = { [QUEUE]: qp, [LB]: lbProfile() };
+
+		const stream = createRunpodStream(profiles, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		const events = await collect(stream);
+
+		// Primary once (maxAttempts 1) then the fallback once; backoff before
+		// the fallback; the fallback's own key is resolved and its request
+		// rebuilt with its model id.
+		expect(mk.dispatches.map((d) => d.method)).toEqual(["queue", "loadBalanced"]);
+		expect(mk.dispatches[1]!.profile).toBe(profiles[LB]);
+		expect(mk.dispatches[1]!.request.model).toBe(LB_MODEL.id);
+		expect(mk.keyCalls.map((k) => k.profile)).toEqual([profiles[QUEUE], profiles[LB]]);
+		expect(mk.sleeps).toEqual([1000]);
+		const done = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
+		)!;
+		expect(done.message.content).toEqual([{ type: "text", text: "LB reply" }]);
+	});
+
+	test("surfaces the last error when the primary and all fallbacks fail", async () => {
+		const mk = makeDeps({
+			queue: () => Promise.reject(markRetryable(new Error("primary 502"))),
+			loadBalanced: () => Promise.reject(markRetryable(new Error("fallback 503"))),
+		});
+		const qp = queueProfile();
+		qp.policy.fallbackProfiles = [LB];
+		const profiles: Record<string, Profile> = { [QUEUE]: qp, [LB]: lbProfile() };
+
+		const stream = createRunpodStream(profiles, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		const error = await resultError(stream);
+
+		expect(mk.dispatches.map((d) => d.method)).toEqual(["queue", "loadBalanced"]);
+		expect((error as Error).message).toContain("fallback 503");
+	});
+
+	test("sends the profile maxTokens when the caller passes none", async () => {
+		const mk = makeDeps();
+		const options = { temperature: 0.2, signal } as unknown as SimpleStreamOptions;
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, options);
+		await stream.result();
+
+		expect(mk.dispatches[0]!.request.maxTokens).toBe(QUEUE_MODEL.maxTokens);
 	});
 });
 

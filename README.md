@@ -209,6 +209,18 @@ must be an absolute `http(s)` URL; its exact spelling is preserved verbatim.
 | `policy.maxAttempts` | positive integer | no | `1` |
 | `policy.fallbackProfiles` | array of profile names | no | `[]` |
 
+`policy` governs dispatch resilience. The primary profile is attempted up to
+`maxAttempts` times, then each named fallback profile once, in order — with a
+1 s backoff between attempts. Only **transient** failures retry or fall back
+(HTTP 5xx responses, e.g. the LB's 502 while a worker cold-starts, and
+network-level failures); deterministic failures (4xx, job failures, output
+shape errors) and caller aborts/timeouts surface immediately. Each fallback
+profile resolves its own `apiKey` and rebuilds the request with its own model
+id — the fallback must be able to serve the same conversation (mind
+`contextWindow`: falling back from a long-context profile to a bounded one
+can overflow the smaller slot). Requests always carry `model.maxTokens` as
+the generation ceiling, so a runaway or post-abort task is bounded.
+
 ### API keys
 
 `apiKey` is a **reference**, never a literal-secret requirement. The parser

@@ -243,11 +243,13 @@ describe("registerRunpodProvider default transport wiring", () => {
 		expect(headers.get("content-type")).toContain("application/json");
 		expect(headers.get("authorization")).toBe(`Bearer ${API_TOKEN}`);
 		// The queue wire body is the adapter envelope: the normalized request
-		// under `input`; a sync profile sets stream:false.
+		// under `input`; a sync profile sets stream:false, and the profile's
+		// maxTokens is always sent (bounds generation even without options).
 		const expectedRequest = {
 			model: profile.model.id,
 			messages: [{ role: "user", content: "ping" }],
 			stream: false,
+			maxTokens: profile.model.maxTokens,
 		};
 		expect(JSON.parse(call.init!.body as string)).toEqual({ input: expectedRequest });
 
@@ -297,11 +299,12 @@ describe("registerRunpodProvider default transport wiring", () => {
 		expect(headers.get("content-type")).toContain("application/json");
 		expect(headers.get("authorization")).toBe(`Bearer ${API_TOKEN}`);
 		// The LB wire posts the normalized request directly — NOT under an
-		// `{ input }` queue envelope.
+		// `{ input }` queue envelope; maxTokens defaults to the profile's.
 		const expectedRequest = {
 			model: lb.model.id,
 			messages: [{ role: "user", content: "ping" }],
 			stream: false,
+			maxTokens: lb.model.maxTokens,
 		};
 		expect(JSON.parse(call.init!.body as string)).toEqual(expectedRequest);
 

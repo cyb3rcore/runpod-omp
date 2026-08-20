@@ -72,6 +72,26 @@ export class UnsupportedOutputShapeError extends Error {
 	}
 }
 
+/**
+ * Classify a thrown transport error as transient (safe to retry): HTTP 5xx
+ * responses and network-level failures. Deterministic failures (4xx, shape
+ * errors, job failures) and caller-side aborts/timeouts are never retryable.
+ * Throw sites set the `retryable` marker explicitly; anything unmarked is
+ * treated as non-retryable.
+ */
+export function isRetryableError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		(error as { retryable?: unknown }).retryable === true
+	);
+}
+
+/** Mark a transport error as transient so the provider can retry it. */
+export function markRetryable(error: Error, retryable = true): Error {
+	(error as { retryable?: unknown }).retryable = retryable;
+	return error;
+}
+
 /** Injectable runtime dependencies for a transport adapter. */
 export interface TransportDeps {
 	/** HTTP client; defaults to the global fetch. */

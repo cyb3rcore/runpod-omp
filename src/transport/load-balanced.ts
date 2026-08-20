@@ -21,7 +21,7 @@
 
 import { decodeOpenAiShaped } from "../adapters/openai-shaped.js";
 import { isRecord, type Profile } from "../profile-schema.js";
-import { UnsupportedOutputShapeError, defaultTransportDeps } from "./types.js";
+import { UnsupportedOutputShapeError, defaultTransportDeps, markRetryable } from "./types.js";
 import type {
 	NormalizedRequest,
 	NormalizedResponse,
@@ -140,6 +140,8 @@ function createAbortScope(
  * Turn a thrown fetch/body error into an explicit one, preferring the most
  * actionable cause: a caller abort, then the request timeout, then the
  * underlying failure. Error text never includes resolved key material.
+ * Network-level failures (the fallthrough path) are marked transient so the
+ * provider can retry them; aborts and timeouts never are.
  */
 function abortAwareError(
 	error: unknown,
@@ -158,13 +160,15 @@ function abortAwareError(
 		return new Error("Load-balanced request aborted");
 	}
 	const message = error instanceof Error ? error.message : String(error);
-	return new Error(`Load-balanced ${phase} failed: ${message}`);
+	return markRetryable(new Error(`Load-balanced ${phase} failed: ${message}`));
 }
 
 /**
  * Build an explicit error for a non-OK status. The message carries the
  * status and, when the error body is a JSON object with an `error.message`,
  * a truncated, control-character-stripped excerpt — never key material.
+ * HTTP 5xx responses are marked transient (the LB returns them while
+ * workers cold-start, route badly, or crash); 4xx are deterministic.
  */
 async function httpError(response: Response): Promise<Error> {
 	const statusText = response.statusText.length > 0 ? ` ${response.statusText}` : "";
@@ -180,7 +184,8 @@ async function httpError(response: Response): Promise<Error> {
 	} catch {
 		// Non-JSON or unreadable error bodies add no detail; the status suffices.
 	}
-	return new Error(`Load-balanced request failed: HTTP ${response.status}${statusText}${detail}`);
+	const error = new Error(`Load-balanced request failed: HTTP ${response.status}${statusText}${detail}`);
+	return response.status >= 500 ? markRetryable(error) : error;
 }
 
 /**

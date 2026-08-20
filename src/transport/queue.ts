@@ -17,7 +17,7 @@ import { decodeMessagesText, encodeMessagesText } from "../adapters/messages-tex
 import { decodeOpenAiShaped, encodeOpenAiShaped } from "../adapters/openai-shaped.js";
 import { isRecord } from "../profile-schema.js";
 import type { Profile } from "../profile-schema.js";
-import { UnsupportedOutputShapeError, defaultTransportDeps } from "./types.js";
+import { UnsupportedOutputShapeError, defaultTransportDeps, markRetryable } from "./types.js";
 import type {
 	DowngradeRecord,
 	NormalizedRequest,
@@ -517,13 +517,15 @@ async function getJson(
 
 /**
  * Parse a response body as JSON, converting HTTP and parse failures to
- * explicit, secret-free errors.
+ * explicit, secret-free errors. HTTP 5xx responses are marked transient so
+ * the provider can retry them; 4xx and parse failures are deterministic.
  */
 async function readJson(response: Response, what: string): Promise<unknown> {
 	if (!response.ok) {
-		throw new Error(
+		const error = new Error(
 			`Runpod queue ${what} request failed with HTTP ${response.status}${await serverErrorText(response)}`,
 		);
+		throw response.status >= 500 ? markRetryable(error) : error;
 	}
 	try {
 		return (await response.json()) as unknown;
