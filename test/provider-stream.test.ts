@@ -50,7 +50,11 @@ import { describe, expect, test } from "bun:test";
 
 // Named import pins the required stream-builder entry point (link-time
 // failure if the module omits it).
-import { createRunpodStream } from "../src/provider.js";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createRunpodStream, type RunpodStreamDeps } from "../src/provider.js";
+import { createJournal } from "../src/journal.js";
 import type { Profile } from "../src/profile-schema.js";
 import { markRetryable } from "../src/transport/types.js";
 import type {
@@ -227,40 +231,41 @@ function makeDeps(
 	const keyCalls: RecordedKeyCall[] = [];
 	const sleeps: number[] = [];
 	const RESOLVED_KEY = "resolved-key-9f3a";
+	const deps: RunpodStreamDeps = {
+		executeQueue(profile: Profile, request: NormalizedRequest, d?: RunpodStreamTransportDeps) {
+			dispatches.push({ method: "queue", profile, request, deps: d });
+			return overrides.queue?.() ?? STREAM_RESULT;
+		},
+		executeLoadBalanced(profile: Profile, request: NormalizedRequest, d?: RunpodStreamTransportDeps) {
+			dispatches.push({ method: "loadBalanced", profile, request, deps: d });
+			return (
+				overrides.loadBalanced?.() ?? {
+					events: [{ type: "text", text: "LB reply" }],
+					details: {
+						requestedMode: "stream",
+						actualMode: "stream",
+						downgrades: [] as DowngradeRecord[],
+					},
+				}
+			);
+		},
+		resolveApiKey(options: SimpleStreamOptions | undefined, profile: Profile) {
+			keyCalls.push({ options, profile });
+			return overrides.resolve?.() ?? RESOLVED_KEY;
+		},
+		// Instant sleep so retry backoff never slows the tests; every
+		// backoff wait is still recorded for assertions.
+		sleep(ms: number) {
+			sleeps.push(ms);
+			return Promise.resolve();
+		},
+	};
 	return {
 		resolvedKey: RESOLVED_KEY,
 		dispatches,
 		keyCalls,
 		sleeps,
-		deps: {
-			executeQueue(profile: Profile, request: NormalizedRequest, d?: RunpodStreamTransportDeps) {
-				dispatches.push({ method: "queue", profile, request, deps: d });
-				return overrides.queue?.() ?? STREAM_RESULT;
-			},
-			executeLoadBalanced(profile: Profile, request: NormalizedRequest, d?: RunpodStreamTransportDeps) {
-				dispatches.push({ method: "loadBalanced", profile, request, deps: d });
-				return (
-					overrides.loadBalanced?.() ?? {
-						events: [{ type: "text", text: "LB reply" }],
-						details: {
-							requestedMode: "stream",
-							actualMode: "stream",
-							downgrades: [] as DowngradeRecord[],
-						},
-					}
-				);
-			},
-			resolveApiKey(options: SimpleStreamOptions | undefined, profile: Profile) {
-				keyCalls.push({ options, profile });
-				return overrides.resolve?.() ?? RESOLVED_KEY;
-			},
-			// Instant sleep so retry backoff never slows the tests; every
-			// backoff wait is still recorded for assertions.
-			sleep(ms: number) {
-				sleeps.push(ms);
-				return Promise.resolve();
-			},
-		},
+		deps,
 	};
 }
 
@@ -838,6 +843,55 @@ describe("createRunpodStream tool calling", () => {
 			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
 		)!;
 		expect(done.reason).toBe("toolUse");
+	});
+});
+
+describe("createRunpodStream journal", () => {
+	test("journals the dispatch lifecycle when deps provide a journal", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "runpod-journal-"));
+		const journalPath = join(dir, "journal.jsonl");
+		const mk = makeDeps();
+		mk.deps.journal = createJournal(journalPath);
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		await stream.result();
+
+		const lines = readFileSync(journalPath, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		expect(lines.map((line) => line.kind)).toEqual(["dispatch", "dispatch-done", "replay-done"]);
+		expect(lines[0]).toMatchObject({
+			model: QUEUE,
+			profile: QUEUE_MODEL.id,
+			attempt: 1,
+			candidate: QUEUE_MODEL.id,
+		});
+		expect(lines[0].request).toMatchObject({ messages: 4, tools: 0, stream: true, maxTokens: 64 });
+		expect(typeof lines[1].durationMs).toBe("number");
+		expect(lines[1].response).toMatchObject({ textChars: 11 });
+	});
+
+	test("journals dispatch errors and the surfaced failure", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "runpod-journal-"));
+		const journalPath = join(dir, "journal.jsonl");
+		const mk = makeDeps({
+			queue: () => Promise.reject(markRetryable(new Error("Load-balanced request failed: HTTP 502"))),
+		});
+		mk.deps.journal = createJournal(journalPath);
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		await resultError(stream);
+
+		const lines = readFileSync(journalPath, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		expect(lines.map((line) => line.kind)).toEqual(["dispatch", "dispatch-error", "failed"]);
+		expect(lines[1].error).toMatchObject({ message: expect.stringContaining("HTTP 502") });
+		expect(lines[2].error).toMatchObject({
+			message: expect.stringContaining("request failed: Load-balanced request failed: HTTP 502"),
+		});
 	});
 });
 

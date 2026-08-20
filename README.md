@@ -383,6 +383,23 @@ Each action requires an explicit queue profile and interactive confirmation.
 Headless sessions fail closed. A model can inspect a queue, but it cannot
 cancel, retry, or purge it.
 
+## Observability
+
+The provider can journal every streamSimple turn as JSONL — the OMP-side
+half of the debugging pipeline (plugin journal ↔ shim request log ↔
+llama-server log). **Disabled by default**; enable by setting the env var:
+
+```
+RUNPOD_OMP_LOG=/path/to/runpod-provider.log.jsonl
+```
+
+Each line records one lifecycle step: `dispatch` (request summary: message
+and tool counts, `maxTokens`, mode), `dispatch-done` (duration, text/
+reasoning/tool-call lengths, usage), `dispatch-error` (message + cause,
+credential bytes redacted), `replay-done`, and `failed` (the surfaced
+error). Unset or empty `RUNPOD_OMP_LOG` disables journaling entirely; a
+journal failure never affects the stream.
+
 ## Security model
 
 - Config parsing and the command surface never resolve or emit credential

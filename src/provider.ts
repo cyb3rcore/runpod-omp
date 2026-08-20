@@ -39,6 +39,7 @@ import type { Profile } from "./profile-schema.js";
 import { executeLoadBalancedTransport } from "./transport/load-balanced.js";
 import { executeQueueTransport } from "./transport/queue.js";
 import { isRetryableError } from "./transport/types.js";
+import { createJournal, resolveJournalPath, type Journal } from "./journal.js";
 import type {
 	NormalizedMessage,
 	NormalizedRequest,
@@ -354,6 +355,8 @@ export interface RunpodStreamDeps {
 	): string | undefined | Promise<string | undefined>;
 	/** Async wait used by retry backoff; defaults to a setTimeout-based sleep. */
 	sleep?: (ms: number) => Promise<void>;
+	/** Per-request journal; defaults to the env-configured journal. */
+	journal?: Journal;
 }
 
 /** Transport deps forwarded from the stream builder. */
@@ -394,6 +397,65 @@ function errorText(cause: unknown, secrets: readonly (string | undefined)[]): st
 	// The unknown-model-id error already carries the provider prefix; avoid
 	// the doubled "runpod provider: runpod provider: …" phrasing.
 	return text.replace(/^runpod provider: /, "");
+}
+
+/** Journal helper: summarize a normalized request without its message bodies. */
+function requestSummary(request: NormalizedRequest): Record<string, unknown> {
+	return {
+		messages: request.messages.length,
+		tools: request.tools?.length ?? 0,
+		...(request.tools !== undefined && request.tools.length > 0
+			? { toolNames: request.tools.map((tool) => tool.function.name) }
+			: {}),
+		...(request.maxTokens !== undefined ? { maxTokens: request.maxTokens } : {}),
+		stream: request.stream,
+	};
+}
+
+/** Journal helper: summarize a transport result (lengths, calls, usage). */
+function responseSummary(result: TransportExecutionResult): Record<string, unknown> {
+	let textChars = 0;
+	let reasoningChars = 0;
+	let toolCalls = 0;
+	let inputTokens: number | undefined;
+	let outputTokens: number | undefined;
+	if (result.response !== undefined) {
+		textChars = result.response.text.length;
+		reasoningChars = result.response.reasoning?.length ?? 0;
+		toolCalls = result.response.toolCalls?.length ?? 0;
+		inputTokens = result.response.usage?.inputTokens;
+		outputTokens = result.response.usage?.outputTokens;
+	} else {
+		for (const event of result.events) {
+			if (event.type === "text") {
+				textChars += event.text.length;
+			} else if (event.type === "reasoning") {
+				reasoningChars += event.text.length;
+			} else if (event.type === "toolcall") {
+				toolCalls += 1;
+			} else if (event.type === "usage") {
+				inputTokens = event.usage.inputTokens;
+				outputTokens = event.usage.outputTokens;
+			}
+		}
+	}
+	return {
+		textChars,
+		...(reasoningChars > 0 ? { reasoningChars } : {}),
+		...(toolCalls > 0 ? { toolCalls } : {}),
+		...(inputTokens !== undefined ? { inputTokens, outputTokens } : {}),
+	};
+}
+
+/** Journal helper: message plus one level of cause, never credential bytes. */
+function errorSummary(error: unknown): { message: string; cause?: string } {
+	const summary: { message: string; cause?: string } = {
+		message: error instanceof Error ? error.message : String(error),
+	};
+	if (error instanceof Error && error.cause instanceof Error) {
+		summary.cause = error.cause.message;
+	}
+	return summary;
 }
 
 /**
@@ -592,6 +654,7 @@ export function createRunpodStream(
 				// failures (HTTP 5xx, network) retry or fall back — a
 				// deterministic 4xx/shape/job error surfaces immediately, and
 				// aborts/timeouts never retry. A backoff separates attempts.
+				const journal = deps.journal;
 				const maxAttempts = Math.max(1, profile.policy.maxAttempts);
 				const fallbacks = profile.policy.fallbackProfiles.filter(
 					(name) => Object.hasOwn(profiles, name) && name !== model.id,
@@ -608,6 +671,7 @@ export function createRunpodStream(
 						if (attempt > 0 || candidateIndex > 0) {
 							await sleepWithAbort(sleep, RETRY_BACKOFF_MS, options?.signal);
 						}
+						const attemptStartedAt = Date.now();
 						try {
 							const candidateKey =
 								candidateIndex === 0 ? apiKey : await deps.resolveApiKey(options, candidate);
@@ -616,14 +680,51 @@ export function createRunpodStream(
 								candidateDeps.apiKey = candidateKey;
 							}
 							const request = buildNormalizedRequest(candidate, context, options);
+							journal?.record({
+								kind: "dispatch",
+								ts: new Date().toISOString(),
+								model: model.id,
+								profile: candidate.model.id,
+								attempt: attempt + 1,
+								candidate: candidate.model.id,
+								request: requestSummary(request),
+							});
 							const result =
 								candidate.endpointType === "queue"
 									? await deps.executeQueue(candidate, request, candidateDeps)
 									: await deps.executeLoadBalanced(candidate, request, candidateDeps);
+							journal?.record({
+								kind: "dispatch-done",
+								ts: new Date().toISOString(),
+								model: model.id,
+								profile: candidate.model.id,
+								attempt: attempt + 1,
+								candidate: candidate.model.id,
+								durationMs: Date.now() - attemptStartedAt,
+								response: responseSummary(result),
+							});
 							replayRunpodStream(stream, result, candidate);
+							journal?.record({
+								kind: "replay-done",
+								ts: new Date().toISOString(),
+								model: model.id,
+								profile: candidate.model.id,
+								attempt: attempt + 1,
+								candidate: candidate.model.id,
+							});
 							dispatched = true;
 						} catch (error) {
 							lastError = error;
+							journal?.record({
+								kind: "dispatch-error",
+								ts: new Date().toISOString(),
+								model: model.id,
+								profile: candidate.model.id,
+								attempt: attempt + 1,
+								candidate: candidate.model.id,
+								durationMs: Date.now() - attemptStartedAt,
+								error: errorSummary(error),
+							});
 							if (!isRetryableError(error)) {
 								throw error;
 							}
@@ -638,7 +739,14 @@ export function createRunpodStream(
 				// ApiKeyResolver function as options.apiKey, which carries no
 				// secret material itself.
 				const ompKey = typeof options?.apiKey === "string" ? options.apiKey : undefined;
-				stream.fail(surfaceRunpodError(error, [ompKey, apiKey]));
+				const surfaced = surfaceRunpodError(error, [ompKey, apiKey]);
+				deps.journal?.record({
+					kind: "failed",
+					ts: new Date().toISOString(),
+					model: model.id,
+					error: errorSummary(surfaced),
+				});
+				stream.fail(surfaced);
 			}
 		}
 	};
@@ -664,6 +772,8 @@ function createDefaultStreamDeps(): RunpodStreamDeps {
 				runCommand: runCommandReference,
 			});
 		},
+		sleep: defaultSleep,
+		journal: createJournal(resolveJournalPath()),
 	};
 }
 
