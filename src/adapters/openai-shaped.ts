@@ -2,7 +2,10 @@
  * OpenAI-shaped transport adapter for Runpod workers that expose an OpenAI
  * chat-completion protocol: the request is wrapped whole under `input`, and
  * the output is a completion object whose `choices[0].message.content` is the
- * assistant text and whose optional `usage` carries the token counts.
+ * assistant text, whose optional `choices[0].message.reasoning_content` is the
+ * model's thinking (streamed models may emit it under
+ * `choices[0].delta.reasoning_content`), and whose optional `usage` carries
+ * the token counts.
  */
 
 import { UnsupportedOutputShapeError } from "../transport/types.js";
@@ -51,6 +54,12 @@ export function decodeOpenAiShaped(output: unknown): NormalizedResponse {
 	}
 
 	const response: NormalizedResponse = { text: content, downgrades: [] };
+
+	// Thinking is optional: preserve it when the worker emits it separately.
+	const reasoning = choice.message.reasoning_content;
+	if (typeof reasoning === "string" && reasoning.length > 0) {
+		response.reasoning = reasoning;
+	}
 
 	if (output.usage !== undefined) {
 		if (!isRecord(output.usage)) {

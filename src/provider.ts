@@ -31,6 +31,7 @@ import {
 	type Message,
 	type SimpleStreamOptions,
 	type TextContent,
+	type ThinkingContent,
 } from "@oh-my-pi/pi-ai";
 import { resolveProfileApiKey } from "./config.js";
 import type { Profile } from "./profile-schema.js";
@@ -147,6 +148,14 @@ function normalizeMessage(message: Message): NormalizedMessage {
  * from the profile, the text projection of the conversation, and the
  * stream/sampling preferences. `stream` mirrors the profile's declared mode;
  * the transport decides how to honor it.
+ *
+ * System messages are hoisted and merged into a single message at index 0:
+ * strict chat templates (e.g. llama.cpp's Qwen3 template) reject a system
+ * message anywhere but the first position with a 500, and OMP legitimately
+ * injects developer-role messages mid-conversation (turn reminders,
+ * compaction notes, interjections). Content is preserved — the instructions
+ * still reach the model, just earlier in context — and no non-system message
+ * changes position.
  */
 function buildNormalizedRequest(
 	profile: Profile,
@@ -155,7 +164,7 @@ function buildNormalizedRequest(
 ): NormalizedRequest {
 	const request: NormalizedRequest = {
 		model: profile.model.id,
-		messages: context.messages.map(normalizeMessage),
+		messages: hoistSystemMessages(context.messages.map(normalizeMessage)),
 		stream: profile.request.mode === "stream",
 	};
 	if (options?.temperature !== undefined) {
@@ -165,6 +174,29 @@ function buildNormalizedRequest(
 		request.maxTokens = options.maxTokens;
 	}
 	return request;
+}
+
+/**
+ * Reorder normalized messages for chat templates that require a single
+ * system message at the very beginning: every system message is joined into
+ * one (in original relative order) and placed at index 0; all non-system
+ * messages keep their relative order. No message content is dropped; when
+ * there is no system message the array is returned unchanged.
+ */
+function hoistSystemMessages(messages: NormalizedMessage[]): NormalizedMessage[] {
+	const systemParts: string[] = [];
+	const rest: NormalizedMessage[] = [];
+	for (const message of messages) {
+		if (message.role === "system") {
+			systemParts.push(message.content);
+		} else {
+			rest.push(message);
+		}
+	}
+	if (systemParts.length === 0) {
+		return messages;
+	}
+	return [{ role: "system", content: systemParts.join("\n\n") }, ...rest];
 }
 
 /**
@@ -198,24 +230,49 @@ export interface RunpodStreamTransportDeps {
 }
 
 /**
- * Fresh, redacted error surfaced to a failed stream. The message is fixed
- * prose carrying the `REDACTED` marker — never the raw model id, key, or
- * transport error bytes. The original error survives only as `cause`, out of
- * reach of the surfaced `.message`.
+ * Surface a failed stream as an explicit error: the underlying cause's
+ * message — transports and the key resolver build actionable, secret-free
+ * messages — with any known credential bytes (the OMP-provided or resolved
+ * API key) replaced by the `REDACTED` marker. The original error survives
+ * as `cause`; an empty or unusable message degrades to the marker so the
+ * surfaced error is never blank.
  */
-function redactRunpodError(cause: unknown): Error {
-	const message = `runpod provider: request failed: ${REDACTED}`;
+function surfaceRunpodError(cause: unknown, secrets: readonly (string | undefined)[]): Error {
+	const message = `runpod provider: request failed: ${errorText(cause, secrets)}`;
 	return new Error(message, { cause });
+}
+
+/** Extract a usable message from a thrown value, redacting known secrets. */
+function errorText(cause: unknown, secrets: readonly (string | undefined)[]): string {
+	let text =
+		cause instanceof Error && cause.message.length > 0
+			? cause.message
+			: typeof cause === "string" && cause.length > 0
+				? cause
+				: "unknown error";
+	for (const secret of secrets) {
+		if (secret !== undefined && secret.length >= 8) {
+			text = text.split(secret).join(REDACTED);
+		}
+	}
+	if (text.trim() === "" || text === REDACTED) {
+		return REDACTED;
+	}
+	// The unknown-model-id error already carries the provider prefix; avoid
+	// the doubled "runpod provider: runpod provider: …" phrasing.
+	return text.replace(/^runpod provider: /, "");
 }
 
 /**
  * Replay a normalized transport result as a valid OMP assistant event
- * sequence: a `start`, one text_start/text_delta/text_end triple per text
- * block, and a terminal `done` event whose message carries the assembled
- * text content, the mapped usage (`input`/`output`/`cacheRead`/`cacheWrite`/
- * `totalTokens`), and `stopReason: "stop"`. Partial metadata always carries
- * the provider (`runpod`), model id, and API id so consumers can attribute
- * the turn.
+ * sequence: a `start`, one thinking_start/thinking_delta/thinking_end triple
+ * for the response's reasoning (when present), one
+ * text_start/text_delta/text_end triple per text block, and a terminal
+ * `done` event whose message carries the assembled content (thinking block
+ * first, then text blocks), the mapped usage (`input`/`output`/`cacheRead`/
+ * `cacheWrite`/`totalTokens`), and `stopReason: "stop"`. Partial metadata
+ * always carries the provider (`runpod`), model id, and API id so consumers
+ * can attribute the turn.
  */
 function replayRunpodStream(
 	stream: AssistantMessageEventStream,
@@ -225,12 +282,16 @@ function replayRunpodStream(
 	// Ordered text blocks: a non-stream response yields its single text; a
 	// streamed result yields each text unit (and its usage) in arrival order.
 	const texts: string[] = [];
+	let reasoning = "";
 	let inputTokens = 0;
 	let outputTokens = 0;
 	let totalTokens = 0;
 
 	if (result.response !== undefined) {
 		texts.push(result.response.text);
+		if (result.response.reasoning !== undefined) {
+			reasoning = result.response.reasoning;
+		}
 		const usage = result.response.usage;
 		if (usage !== undefined) {
 			inputTokens = usage.inputTokens;
@@ -241,6 +302,8 @@ function replayRunpodStream(
 		for (const event of result.events) {
 			if (event.type === "text") {
 				texts.push(event.text);
+			} else if (event.type === "reasoning") {
+				reasoning += event.text;
 			} else if (event.type === "usage") {
 				inputTokens = event.usage.inputTokens;
 				outputTokens = event.usage.outputTokens;
@@ -249,7 +312,15 @@ function replayRunpodStream(
 		}
 	}
 
-	const content: TextContent[] = texts.map((text) => ({ type: "text", text }));
+	// Thinking precedes the answer; each block owns its content index.
+	const content: (ThinkingContent | TextContent)[] = [];
+	if (reasoning.length > 0) {
+		content.push({ type: "thinking", thinking: reasoning });
+	}
+	for (const text of texts) {
+		content.push({ type: "text", text });
+	}
+
 	const partial: AssistantMessage = {
 		role: "assistant",
 		content,
@@ -270,10 +341,18 @@ function replayRunpodStream(
 
 	stream.push({ type: "start", partial });
 
-	content.forEach((block, contentIndex) => {
+	let nextIndex = 0;
+	if (reasoning.length > 0) {
+		stream.push({ type: "thinking_start", contentIndex: 0, partial });
+		stream.push({ type: "thinking_delta", contentIndex: 0, delta: reasoning, partial });
+		stream.push({ type: "thinking_end", contentIndex: 0, content: reasoning, partial });
+		nextIndex = 1;
+	}
+	texts.forEach((text, offset) => {
+		const contentIndex = nextIndex + offset;
 		stream.push({ type: "text_start", contentIndex, partial });
-		stream.push({ type: "text_delta", contentIndex, delta: block.text, partial });
-		stream.push({ type: "text_end", contentIndex, content: block.text, partial });
+		stream.push({ type: "text_delta", contentIndex, delta: text, partial });
+		stream.push({ type: "text_end", contentIndex, content: text, partial });
 	});
 
 	stream.push({ type: "done", reason: "stop", message: partial });
@@ -289,8 +368,9 @@ function replayRunpodStream(
  * It always returns a REAL `AssistantMessageEventStream` — never a plain
  * value or a synchronous throw. Unknown model ids, key-resolution failures,
  * and transport failures are each surfaced asynchronously via
- * `stream.fail(...)` with a redacted error, and no dispatch happens before
- * its preceding step has succeeded. Profile lookup is an own-key read on the
+ * `stream.fail(...)` with an explicit error (known credential bytes
+ * redacted), and no dispatch happens before its preceding step has
+ * succeeded. Profile lookup is an own-key read on the
  * `Record`; routing consumes only `profile.endpointType` and no provider-level
  * endpoint configuration.
  */
@@ -308,6 +388,9 @@ export function createRunpodStream(
 		return stream;
 
 		async function run(): Promise<void> {
+			// Hoisted out of the try block so the catch can redact the
+			// resolved key's bytes if a later step's error echoes them.
+			let apiKey: string | undefined;
 			try {
 				// Own-key lookup strictly by model.id; never inherited keys.
 				const profile = Object.hasOwn(profiles, model.id) ? profiles[model.id] : undefined;
@@ -317,7 +400,7 @@ export function createRunpodStream(
 					);
 				}
 				const request = buildNormalizedRequest(profile, context, options);
-				const apiKey = await deps.resolveApiKey(options, profile);
+				apiKey = await deps.resolveApiKey(options, profile);
 				const transportDeps: RunpodStreamTransportDeps = {};
 				if (apiKey !== undefined) {
 					transportDeps.apiKey = apiKey;
@@ -333,7 +416,11 @@ export function createRunpodStream(
 
 				replayRunpodStream(stream, result, profile);
 			} catch (error) {
-				stream.fail(redactRunpodError(error));
+				// Only literal key bytes can be redacted; OMP also permits an
+				// ApiKeyResolver function as options.apiKey, which carries no
+				// secret material itself.
+				const ompKey = typeof options?.apiKey === "string" ? options.apiKey : undefined;
+				stream.fail(surfaceRunpodError(error, [ompKey, apiKey]));
 			}
 		}
 	};
@@ -414,7 +501,7 @@ export function registerRunpodProvider(
 		streamSimple: (model, context, options) => {
 			// Always a REAL AssistantMessageEventStream: unknown ids,
 			// key-resolution failures, and transport failures surface
-			// asynchronously via stream.fail (redacted).
+			// asynchronously via stream.fail (explicit, secrets redacted).
 			return defaultStream(model, context, options);
 		},
 	});

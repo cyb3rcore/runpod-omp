@@ -43,13 +43,19 @@ export interface DowngradeRecord {
 /** A unit of streamed output; the union is discriminated on `type`. */
 export type NormalizedStreamEvent =
 	| { type: "text"; text: string }
+	| { type: "reasoning"; text: string }
 	| { type: "tool"; name: string; argumentsJson?: string; result?: string }
 	| { type: "usage"; usage: NormalizedUsage }
 	| { type: "downgrade"; record: DowngradeRecord };
 
-/** Normalized result of a transport call; usage is omitted when absent. */
+/**
+ * Normalized result of a transport call; usage is omitted when absent, and
+ * `reasoning` carries the model's thinking text (e.g. OpenAI `reasoning_content`)
+ * when the worker emits it separately from the answer.
+ */
 export interface NormalizedResponse {
 	text: string;
+	reasoning?: string;
 	usage?: NormalizedUsage;
 	downgrades: DowngradeRecord[];
 }

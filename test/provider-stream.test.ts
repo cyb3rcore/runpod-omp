@@ -36,10 +36,11 @@
  *     stopping with `stopReason: "stop"`.
  *
  * Failure contract: unknown `model.id`, a key-resolution failure, and a
- * transport failure each FAIL the returned stream (via `stream.fail`) with a
- * redacted `Error` whose message contains `[redacted]` and never the raw
- * model id, key, or transport error. Failures happen before any dispatch
- * when they precede it — never a synchronous throw from `createRunpodStream`.
+ * transport failure each FAIL the returned stream (via `stream.fail`) with
+ * an explicit `Error` whose message surfaces the underlying cause (known
+ * credential bytes replaced by `[redacted]`), never a synchronous throw
+ * from `createRunpodStream`. Failures happen before any dispatch when they
+ * precede it.
  *
  * No real Runpod credentials or network are used: the transports and key
  * resolver are recording mocks; the stream is consumed through the real
@@ -162,9 +163,12 @@ function expectedRequest(modelId: string): NormalizedRequest {
 	return {
 		model: modelId,
 		messages: [
+			// The mid-conversation developer message is hoisted to a single
+			// system message at index 0 (Qwen3 templates reject system
+			// anywhere else); non-system messages keep their order.
+			{ role: "system", content: "be concise" },
 			{ role: "user", content: "ping" },
 			{ role: "assistant", content: "pong" },
-			{ role: "system", content: "be concise" },
 			{ role: "tool", content: "file contents", name: "read" },
 		],
 		stream: true,
@@ -413,8 +417,134 @@ describe("createRunpodStream event replay", () => {
 	});
 });
 
+describe("createRunpodStream system-message normalization", () => {
+	test("merges multiple system messages into one at index 0, preserving non-system order", async () => {
+		const mk = makeDeps();
+		const context = {
+			messages: [
+				{ role: "user", content: "q1" },
+				{ role: "developer", content: "first instruction" },
+				{ role: "assistant", content: "a1" },
+				{ role: "developer", content: "second instruction" },
+			],
+		} as unknown as Context;
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), context, FAKE_OPTIONS);
+		await stream.result();
+
+		expect(mk.dispatches[0]!.request.messages).toEqual([
+			{ role: "system", content: "first instruction\n\nsecond instruction" },
+			{ role: "user", content: "q1" },
+			{ role: "assistant", content: "a1" },
+		]);
+	});
+
+	test("a conversation with no system messages is sent unchanged", async () => {
+		const mk = makeDeps();
+		const context = {
+			messages: [{ role: "user", content: "q1" }],
+		} as unknown as Context;
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), context, FAKE_OPTIONS);
+		await stream.result();
+
+		expect(mk.dispatches[0]!.request.messages).toEqual([{ role: "user", content: "q1" }]);
+	});
+});
+
+describe("createRunpodStream reasoning replay", () => {
+	test("response-mode reasoning replays as a thinking block before the text", async () => {
+		const qp = queueProfile({ mode: "sync" });
+		const mk = makeDeps({
+			queue: () => ({
+				response: {
+					text: "Final answer",
+					reasoning: "Let me think about this.",
+					usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+					downgrades: [] as DowngradeRecord[],
+				},
+				events: [],
+				details: { requestedMode: "sync", actualMode: "sync", downgrades: [] as DowngradeRecord[] },
+			}),
+		});
+
+		const stream = createRunpodStream({ [QUEUE]: qp }, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		const events = await collect(stream);
+
+		expect(events.map((e) => e.type)).toEqual([
+			"start",
+			"thinking_start",
+			"thinking_delta",
+			"thinking_end",
+			"text_start",
+			"text_delta",
+			"text_end",
+			"done",
+		]);
+
+		const thinking = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "thinking_end" }> => e.type === "thinking_end",
+		)!;
+		expect(thinking.contentIndex).toBe(0);
+		expect(thinking.content).toBe("Let me think about this.");
+
+		const textStart = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "text_start" }> => e.type === "text_start",
+		)!;
+		expect(textStart.contentIndex).toBe(1);
+
+		const done = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
+		)!;
+		expect(done.message.content).toEqual([
+			{ type: "thinking", thinking: "Let me think about this." },
+			{ type: "text", text: "Final answer" },
+		]);
+		expect(done.message.usage).toMatchObject({ input: 3, output: 2, totalTokens: 5 });
+	});
+
+	test("streamed reasoning events accumulate into the thinking block", async () => {
+		const mk = makeDeps({
+			queue: () => ({
+				events: [
+					{ type: "reasoning", text: "Step one. " },
+					{ type: "reasoning", text: "Step two." },
+					{ type: "text", text: "Answer." },
+					{ type: "usage", usage: STREAM_USAGE },
+				],
+				details: {
+					requestedMode: "stream",
+					actualMode: "stream",
+					downgrades: [] as DowngradeRecord[],
+				},
+			}),
+		});
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		const events = await collect(stream);
+
+		const thinking = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "thinking_end" }> => e.type === "thinking_end",
+		)!;
+		expect(thinking.content).toBe("Step one. Step two.");
+
+		const textDeltas = events
+			.filter((e): e is Extract<AssistantMessageEvent, { type: "text_delta" }> => e.type === "text_delta")
+			.map((d) => d.delta);
+		expect(textDeltas).toEqual(["Answer."]);
+
+		const done = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
+		)!;
+		expect(done.message.content).toEqual([
+			{ type: "thinking", thinking: "Step one. Step two." },
+			{ type: "text", text: "Answer." },
+		]);
+	});
+});
+
 describe("createRunpodStream failures", () => {
-	test("fails the returned stream with a redacted error for an unknown model id", async () => {
+	test("fails the returned stream with an explicit error for an unknown model id", async () => {
 		const mk = makeDeps();
 		const UNKNOWN = "ghost-profile";
 
@@ -423,27 +553,35 @@ describe("createRunpodStream failures", () => {
 
 		const error = await resultError(stream);
 		expect(error).toBeInstanceOf(Error);
-		expect((error as Error).message).toContain("[redacted]");
+		expect((error as Error).message).toContain("unknown model id");
 		expect((error as Error).message).not.toContain(UNKNOWN);
 		expect(mk.dispatches).toHaveLength(0);
 		expect(mk.keyCalls).toHaveLength(0);
 	});
 
-	test("a key-resolution failure fails the stream with a redacted error and dispatches nothing", async () => {
+	test("a key-resolution failure fails the stream with the resolver's explicit error and dispatches nothing", async () => {
 		const SECRET = "wipe-the-earth-token-123";
-		const mk = makeDeps({ resolve: () => { throw new Error(`resolve failed: ${SECRET}`); } });
+		// The production resolver already builds secret-free errors; the mock
+		// mirrors that shape so the surfaced message stays meaningful.
+		const mk = makeDeps({
+			resolve: () => {
+				throw new Error(
+					"no apiKey source: profile has no apiKey reference, OMP key, or RUNPOD_API_KEY (redacted)",
+				);
+			},
+		});
 
 		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
 
 		const error = await resultError(stream);
 		expect(error).toBeInstanceOf(Error);
-		expect((error as Error).message).toContain("[redacted]");
+		expect((error as Error).message).toContain("no apiKey source");
+		expect((error as Error).message).toContain("redacted");
 		expect((error as Error).message).not.toContain(SECRET);
-		expect((error as Error).message).not.toContain("wipe-the-earth-token-123");
 		expect(mk.dispatches).toHaveLength(0);
 	});
 
-	test("a transport rejection fails the stream with a redacted error", async () => {
+	test("a transport rejection fails the stream with the transport's explicit error", async () => {
 		const RAW = "connection refused to runpod worker";
 		const mk = makeDeps({ queue: () => Promise.reject(new Error(RAW)) });
 
@@ -451,7 +589,21 @@ describe("createRunpodStream failures", () => {
 
 		const error = await resultError(stream);
 		expect(error).toBeInstanceOf(Error);
-		expect((error as Error).message).toContain("[redacted]");
-		expect((error as Error).message).not.toContain(RAW);
+		// The surfaced message is the actionable transport error, not a marker.
+		expect((error as Error).message).toContain(RAW);
+	});
+
+	test("a transport error echoing the resolved key has those bytes redacted", async () => {
+		const mk = makeDeps({
+			queue: () => Promise.reject(new Error(`worker rejected: ${mk.resolvedKey}`)),
+		});
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const error = await resultError(stream);
+		expect(error).toBeInstanceOf(Error);
+		const message = (error as Error).message;
+		expect(message).toContain("worker rejected: [redacted]");
+		expect(message).not.toContain(mk.resolvedKey);
 	});
 });

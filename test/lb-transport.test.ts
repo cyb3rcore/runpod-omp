@@ -208,6 +208,54 @@ describe("executeLoadBalancedTransport", () => {
 		expect(result.details).toEqual({ requestedMode: "stream", actualMode: "stream", downgrades: [] });
 	});
 
+	test("preserves SSE reasoning_content events ahead of text and aggregates them", async () => {
+		const sseBody = [
+			'data: {"choices":[{"delta":{"reasoning_content":"Let me"},"index":0}]}',
+			"",
+			'data: {"choices":[{"delta":{"reasoning_content":" think."},"index":0}]}',
+			"",
+			'data: {"choices":[{"delta":{"content":"Answer."},"index":0}]}',
+			"",
+		].join("\n");
+		const { fetchMock } = recordingFetch(
+			() => new Response(sseBody, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+
+		const result = await executeLoadBalancedTransport(
+			lbProfile({ mode: "stream" }),
+			requestFixture({ stream: true }),
+			{ fetch: fetchMock },
+		);
+
+		// Reasoning units and text units are each preserved as distinct events.
+		expect(result.events).toEqual([
+			{ type: "reasoning", text: "Let me" },
+			{ type: "reasoning", text: " think." },
+			{ type: "text", text: "Answer." },
+		]);
+		expect(result.response).toEqual({
+			text: "Answer.",
+			reasoning: "Let me think.",
+			downgrades: [],
+		});
+	});
+
+	test("decodes reasoning_content from a JSON completion body", async () => {
+		const { fetchMock } = recordingFetch(() =>
+			jsonResponse({
+				choices: [{ message: { content: "Final", reasoning_content: "Hidden chain" } }],
+			}),
+		);
+
+		const result = await executeLoadBalancedTransport(lbProfile(), requestFixture(), { fetch: fetchMock });
+
+		expect(result.response).toEqual({
+			text: "Final",
+			reasoning: "Hidden chain",
+			downgrades: [],
+		});
+	});
+
 	test("details omit the queue-only jobId, status, and depth fields", async () => {
 		const { fetchMock } = recordingFetch(() =>
 			jsonResponse({ choices: [{ message: { content: "done" } }] }),

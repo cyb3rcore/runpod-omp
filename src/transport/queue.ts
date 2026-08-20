@@ -232,6 +232,9 @@ async function executeStream(params: QueueTransportContext): Promise<TransportEx
 	const events: NormalizedStreamEvent[] = [];
 	for (const chunk of chunks) {
 		const decoded = params.decode(streamChunkOutput(chunk));
+		if (decoded.reasoning !== undefined && decoded.reasoning.length > 0) {
+			events.push({ type: "reasoning", text: decoded.reasoning });
+		}
 		events.push({ type: "text", text: decoded.text });
 		if (decoded.usage !== undefined) {
 			events.push({ type: "usage", usage: decoded.usage });

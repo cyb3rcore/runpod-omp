@@ -6,11 +6,12 @@
  * transport never calls the queue-only `/run`, `/runsync`, `/status`, or
  * `/stream` routes, and its result details never carry the queue-only
  * `jobId`, `status`, or `depth` fields. The normalized OpenAI Chat
- * Completions request is POSTed directly (no `input` envelope — that is the
+ * completions request is POSTed directly (no `input` envelope — that is the
  * queue wire format) and the response is decoded with the openai-shaped
  * adapter (JSON) or parsed as Server-Sent Events (SSE): each `data:` frame's
- * `choices[0].delta.content` is preserved as a text event and aggregated
- * into the response text, `[DONE]` is ignored, and a chunk's usage is kept
+ * `choices[0].delta.content` is preserved as a text event and its
+ * `choices[0].delta.reasoning_content` as a reasoning event, both aggregated
+ * into the response, `[DONE]` is ignored, and a chunk's usage is kept
  * when present.
  *
  * A load-balanced profile has a single wire behavior (one direct HTTP
@@ -183,20 +184,24 @@ async function httpError(response: Response): Promise<Error> {
 }
 
 /**
- * Parse an SSE document into normalized text/usage events plus the
+ * Parse an SSE document into normalized text/reasoning/usage events plus the
  * aggregated response text. `data:` frames are JSON OpenAI chat-completion
- * chunks: `choices[0].delta.content` becomes a text event, a chunk's usage
- * becomes a usage event (and the response usage), and `[DONE]` is ignored.
- * Frames that are neither `[DONE]` nor valid JSON are an explicit error —
- * never guessed into a successful answer.
+ * chunks: `choices[0].delta.content` becomes a text event,
+ * `choices[0].delta.reasoning_content` becomes a reasoning event (and the
+ * response reasoning), a chunk's usage becomes a usage event (and the
+ * response usage), and `[DONE]` is ignored. Frames that are neither `[DONE]`
+ * nor valid JSON are an explicit error — never guessed into a successful
+ * answer.
  */
 function parseSse(bodyText: string): {
 	events: NormalizedStreamEvent[];
 	text: string;
+	reasoning?: string;
 	usage?: NormalizedUsage;
 } {
 	const events: NormalizedStreamEvent[] = [];
 	let text = "";
+	let reasoning = "";
 	let usage: NormalizedUsage | undefined;
 	let frame = "";
 	let frameHasData = false;
@@ -226,9 +231,15 @@ function parseSse(bodyText: string): {
 				const choice: unknown = rawChoices[0];
 				if (isRecord(choice)) {
 					const delta: unknown = choice.delta;
-					if (isRecord(delta) && typeof delta.content === "string" && delta.content.length > 0) {
-						events.push({ type: "text", text: delta.content });
-						text += delta.content;
+					if (isRecord(delta)) {
+						if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+							events.push({ type: "reasoning", text: delta.reasoning_content });
+							reasoning += delta.reasoning_content;
+						}
+						if (typeof delta.content === "string" && delta.content.length > 0) {
+							events.push({ type: "text", text: delta.content });
+							text += delta.content;
+						}
 					}
 				}
 			}
@@ -264,7 +275,7 @@ function parseSse(bodyText: string): {
 	}
 	flushFrame();
 
-	return { events, text, usage };
+	return { events, text, reasoning, usage };
 }
 
 /** Decode a JSON completion body with the openai-shaped adapter. */
@@ -302,8 +313,11 @@ async function parseSseResponse(
 	} catch (error) {
 		throw failure(error, "response read");
 	}
-	const { events, text, usage } = parseSse(bodyText);
+	const { events, text, reasoning, usage } = parseSse(bodyText);
 	const responseBody: NormalizedResponse = { text, downgrades: [] };
+	if (reasoning !== undefined && reasoning.length > 0) {
+		responseBody.reasoning = reasoning;
+	}
 	if (usage !== undefined) {
 		responseBody.usage = usage;
 	}
@@ -321,7 +335,8 @@ async function parseSseResponse(
  * `invokeUrl + loadBalancedPath` (no `input` envelope, no queue routes).
  * JSON responses are decoded with the openai-shaped adapter; SSE responses
  * preserve each `data:` frame's `choices[0].delta.content` as a text event
- * and aggregate it into the response text. The caller's AbortSignal and the
+ * and `choices[0].delta.reasoning_content` as a reasoning event, both
+ * aggregated into the response. The caller's AbortSignal and the
  * profile's request timeout bound the call, and errors never include
  * resolved key material.
  */

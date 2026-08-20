@@ -162,8 +162,9 @@ empty `env:` reference falls through to the OMP key and then
 an explicit error and **never** falls back. If no source yields a key, the
 call fails with a redacted error (never a credential).
 
-Every diagnostic, serialized profile, tool result, and error strips key
-material to a fixed `[redacted]` marker.
+Every diagnostic, serialized profile, and tool result strips key material
+to a fixed `[redacted]` marker. Stream errors surface the underlying cause
+with only known credential bytes redacted (see Security model).
 
 ## Provider: `runpod/<profile>`
 
@@ -191,7 +192,8 @@ The transport drives Runpod's managed-queue API:
 
 Queue jobs report native statuses (`IN_QUEUE`, `IN_PROGRESS`, `COMPLETED`,
 `FAILED`, `CANCELLED`, `TIMED_OUT`, plus `RUNNING`/`unknown`/`expired`).
-`failed`/`cancelled`/`timed_out` jobs surface as explicit, redacted errors.
+`failed`/`cancelled`/`timed_out` jobs surface as explicit errors naming the
+job and status, with any server-provided detail.
 
 ### Load-balanced (`endpointType: load-balanced`)
 
@@ -297,9 +299,14 @@ cancel, retry, or purge it.
 ## Security model
 
 - Config parsing and the command surface never resolve or emit credential
-  bytes; every exposed form (serialized profiles, tool results, errors, and
-  diagnostics) uses a fixed `[redacted]` marker. `!command` references that
-  fail never fall back to another key source.
+  bytes; every exposed form (serialized profiles, tool results, diagnostics)
+  uses a fixed `[redacted]` marker. `!command` references that fail never
+  fall back to another key source.
+- Stream failures surface the underlying transport/resolver error verbatim —
+  HTTP status and server detail, timeout, abort, output-shape, unknown
+  profile — so failures are actionable. Only known credential bytes (the
+  resolved or OMP-provided API key) are replaced with `[redacted]`; the
+  original error survives as the surfaced error's `cause`.
 - Errors never carry resolved key material, command output, or a runner's
   message.
 
