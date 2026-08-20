@@ -46,6 +46,11 @@ export interface NormalizedRequest {
 	maxTokens?: number;
 	/** Function-tool definitions; absent when the context carried no tools. */
 	tools?: NormalizedTool[];
+	/**
+	 * OpenAI streaming options: request the usage object in the final SSE
+	 * chunk (streamed responses omit it otherwise, per the OpenAI spec).
+	 */
+	stream_options?: { include_usage: boolean };
 }
 
 /** Token accounting mapped from the wire format's own usage shape. */

@@ -177,6 +177,8 @@ function expectedRequest(modelId: string): NormalizedRequest {
 			{ role: "tool", content: "file contents", name: "read" },
 		],
 		stream: true,
+		// Streamed responses omit usage unless explicitly requested.
+		stream_options: { include_usage: true },
 		temperature: 0.7,
 		maxTokens: 64,
 	};

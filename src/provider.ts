@@ -265,6 +265,12 @@ function buildNormalizedRequest(
 	// caller does not pass one, so a runaway (or zombie, post-abort) task
 	// cannot burn the slot unbounded.
 	request.maxTokens = options?.maxTokens ?? profile.model.maxTokens;
+	// Streamed responses omit the usage object unless it is explicitly
+	// requested (OpenAI spec; llama.cpp honors stream_options) — without
+	// this the turn would show no per-turn token counts.
+	if (request.stream) {
+		request.stream_options = { include_usage: true };
+	}
 	// Forward OMP's function-tool catalog so the worker can offer tool
 	// calling; absent when the context carries no tools. Schemas are
 	// sanitized: llama.cpp's JSON-schema→grammar converter passes regex-ish
