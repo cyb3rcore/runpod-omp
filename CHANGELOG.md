@@ -1,3 +1,11 @@
+## 1.2.1
+
+- **fix:** request usage in streamed responses (`965f199`)
+  OpenAI-compliant streamed responses omit the usage object unless the
+client sends stream_options.include_usage; llama.cpp honors that. Without
+it, streamed turns showed no per-turn token counts. Send
+stream_options:{include_usage:true} whenever streaming.
+
 ## 1.2.0
 
 - **feat:** per-request journal, disabled by default (`c8ad8f5`)
