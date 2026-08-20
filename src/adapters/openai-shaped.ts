@@ -4,21 +4,24 @@
  * the output is a completion object whose `choices[0].message.content` is the
  * assistant text, whose optional `choices[0].message.reasoning_content` is the
  * model's thinking (streamed models may emit it under
- * `choices[0].delta.reasoning_content`), and whose optional `usage` carries
- * the token counts.
+ * `choices[0].delta.reasoning_content`), whose optional
+ * `choices[0].message.tool_calls` are the function calls the model chose, and
+ * whose optional `usage` carries the token counts.
  */
 
 import { UnsupportedOutputShapeError } from "../transport/types.js";
 import type {
 	NormalizedRequest,
 	NormalizedResponse,
+	NormalizedToolCall,
 	NormalizedUsage,
 } from "../transport/types.js";
 
 const EXPECTED_SHAPE =
 	"an OpenAI chat-completion object with a non-empty choices array, " +
-	"string choices[0].message.content, and an optional usage object with " +
-	"numeric prompt_tokens/completion_tokens/total_tokens";
+	"a choices[0].message with string content and/or a tool_calls array, " +
+	"and an optional usage object with numeric " +
+	"prompt_tokens/completion_tokens/total_tokens";
 
 /** Narrow unknown to a plain record; the parser boundary for wire data. */
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -48,12 +51,21 @@ export function decodeOpenAiShaped(output: unknown): NormalizedResponse {
 		throw new UnsupportedOutputShapeError(EXPECTED_SHAPE);
 	}
 
+	// Tool-calling turns legitimately carry empty content; at least one of
+	// content or tool_calls must be present.
+	const toolCalls = parseToolCalls(choice.message.tool_calls);
 	const content = choice.message.content;
-	if (typeof content !== "string") {
+	if (typeof content !== "string" && toolCalls.length === 0) {
 		throw new UnsupportedOutputShapeError(EXPECTED_SHAPE);
 	}
 
-	const response: NormalizedResponse = { text: content, downgrades: [] };
+	const response: NormalizedResponse = {
+		text: typeof content === "string" ? content : "",
+		downgrades: [],
+	};
+	if (toolCalls.length > 0) {
+		response.toolCalls = toolCalls;
+	}
 
 	// Thinking is optional: preserve it when the worker emits it separately.
 	const reasoning = choice.message.reasoning_content;
@@ -82,4 +94,28 @@ export function decodeOpenAiShaped(output: unknown): NormalizedResponse {
 	}
 
 	return response;
+}
+
+/**
+ * Parse an OpenAI `message.tool_calls` array into normalized calls. Each item
+ * is `{id, type, function: {name, arguments}}` with `arguments` as a JSON
+ * string; malformed items are skipped, an empty result means no calls.
+ */
+function parseToolCalls(input: unknown): NormalizedToolCall[] {
+	if (!Array.isArray(input)) {
+		return [];
+	}
+	const calls: NormalizedToolCall[] = [];
+	for (const item of input) {
+		if (!isRecord(item) || typeof item.id !== "string" || item.id.length === 0) {
+			continue;
+		}
+		const fn = isRecord(item.function) ? item.function : undefined;
+		if (fn === undefined || typeof fn.name !== "string" || fn.name.length === 0) {
+			continue;
+		}
+		const argumentsJson = typeof fn.arguments === "string" ? fn.arguments : "";
+		calls.push({ id: item.id, name: fn.name, argumentsJson });
+	}
+	return calls;
 }

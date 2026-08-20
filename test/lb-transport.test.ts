@@ -257,6 +257,63 @@ describe("executeLoadBalancedTransport", () => {
 		});
 	});
 
+	test("decodes tool_calls from a JSON completion body", async () => {
+		const { fetchMock } = recordingFetch(() =>
+			jsonResponse({
+				choices: [
+					{
+						message: {
+							content: null,
+							tool_calls: [
+								{ id: "call_1", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } },
+							],
+						},
+						finish_reason: "tool_calls",
+					},
+				],
+			}),
+		);
+
+		const result = await executeLoadBalancedTransport(lbProfile(), requestFixture(), { fetch: fetchMock });
+
+		expect(result.response).toEqual({
+			text: "",
+			toolCalls: [{ id: "call_1", name: "bash", argumentsJson: '{"command":"ls"}' }],
+			downgrades: [],
+		});
+	});
+
+	test("accumulates fragmented SSE tool_calls by index", async () => {
+		const sseBody = [
+			'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]},"index":0}]}',
+			"",
+			'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"command\\":"}}]},"index":0}]}',
+			"",
+			'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"ls\\"}"}}]},"index":0,"finish_reason":"tool_calls"}]}',
+			"",
+		].join("\n");
+		const { fetchMock } = recordingFetch(
+			() => new Response(sseBody, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+
+		const result = await executeLoadBalancedTransport(
+			lbProfile({ mode: "stream" }),
+			requestFixture({ stream: true }),
+			{ fetch: fetchMock },
+		);
+
+		// The three fragments reassemble into one call: id + name from the
+		// first delta, arguments concatenated across the next two.
+		expect(result.events).toEqual([
+			{ type: "toolcall", call: { id: "call_1", name: "bash", argumentsJson: '{"command":"ls"}' } },
+		]);
+		expect(result.response).toEqual({
+			text: "",
+			toolCalls: [{ id: "call_1", name: "bash", argumentsJson: '{"command":"ls"}' }],
+			downgrades: [],
+		});
+	});
+
 	test("details omit the queue-only jobId, status, and depth fields", async () => {
 		const { fetchMock } = recordingFetch(() =>
 			jsonResponse({ choices: [{ message: { content: "done" } }] }),

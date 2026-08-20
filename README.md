@@ -133,7 +133,7 @@ profiles:
       maxTokens: 12288
       reasoning: true
       input: [text, image]
-      supportsTools: false
+      supportsTools: true
       supportsVision: true
     request:
       mode: sync
@@ -150,7 +150,7 @@ profiles:
       maxTokens: 8192
       reasoning: true
       input: [text, image]
-      supportsTools: false
+      supportsTools: true
       supportsVision: true
     request:
       mode: sync
@@ -220,6 +220,13 @@ id — the fallback must be able to serve the same conversation (mind
 `contextWindow`: falling back from a long-context profile to a bounded one
 can overflow the smaller slot). Requests always carry `model.maxTokens` as
 the generation ceiling, so a runaway or post-abort task is bounded.
+
+**Tool calling** is wired end-to-end: OMP's `context.tools` are forwarded as
+OpenAI function definitions, assistant history round-trips `tool_calls`, and
+worker tool calls (JSON or SSE, with fragmented `arguments` reassembled) are
+replayed as OMP tool-call events with `stopReason: "toolUse"`. A profile must
+declare `supportsTools: true` (the plugin ignores it for registration — OMP
+always passes the tool catalog — but the flag documents the capability).
 
 ### API keys
 

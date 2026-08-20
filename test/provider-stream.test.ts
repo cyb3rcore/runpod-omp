@@ -661,6 +661,140 @@ describe("createRunpodStream retry & fallback", () => {
 	});
 });
 
+describe("createRunpodStream tool calling", () => {
+	test("forwards context.tools as OpenAI function definitions", async () => {
+		const mk = makeDeps();
+		const tool = {
+			name: "bash",
+			description: "Run a shell command",
+			parameters: { type: "object", properties: { command: { type: "string" } } },
+		};
+		const context = {
+			messages: [{ role: "user", content: "list files" }],
+			tools: [tool],
+		} as unknown as Context;
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), context, FAKE_OPTIONS);
+		await stream.result();
+
+		expect(mk.dispatches[0]!.request.tools).toEqual([
+			{ type: "function", function: tool },
+		]);
+	});
+
+	test("round-trips assistant tool calls into wire tool_calls", async () => {
+		const mk = makeDeps();
+		const context = {
+			messages: [
+				{ role: "user", content: "list files" },
+				{
+					role: "assistant",
+					content: [
+						{ type: "text", text: "" },
+						{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "ls" } },
+					],
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_1",
+					toolName: "bash",
+					isError: false,
+					content: [{ type: "text", text: "a.txt" }],
+				},
+			],
+		} as unknown as Context;
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), context, FAKE_OPTIONS);
+		await stream.result();
+
+		const request = mk.dispatches[0]!.request;
+		expect(request.messages[1]).toEqual({
+			role: "assistant",
+			content: "",
+			toolCalls: [{ id: "call_1", name: "bash", argumentsJson: '{"command":"ls"}' }],
+		});
+		expect(request.messages[2]).toEqual({ role: "tool", content: "a.txt", name: "bash" });
+	});
+
+	test("replays response tool calls as toolcall events with toolUse stop reason", async () => {
+		const qp = queueProfile({ mode: "sync" });
+		const mk = makeDeps({
+			queue: () => ({
+				response: {
+					text: "",
+					toolCalls: [{ id: "call_9", name: "bash", argumentsJson: '{"command":"ls"}' }],
+					usage: { inputTokens: 4, outputTokens: 3, totalTokens: 7 },
+					downgrades: [] as DowngradeRecord[],
+				},
+				events: [],
+				details: { requestedMode: "sync", actualMode: "sync", downgrades: [] as DowngradeRecord[] },
+			}),
+		});
+
+		const stream = createRunpodStream({ [QUEUE]: qp }, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		const events = await collect(stream);
+
+		expect(events.map((e) => e.type)).toEqual([
+			"start",
+			"toolcall_start",
+			"toolcall_delta",
+			"toolcall_end",
+			"done",
+		]);
+
+		const end = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "toolcall_end" }> => e.type === "toolcall_end",
+		)!;
+		expect(end.contentIndex).toBe(0);
+		expect(end.toolCall).toEqual({
+			type: "toolCall",
+			id: "call_9",
+			name: "bash",
+			arguments: { command: "ls" },
+		});
+
+		const done = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
+		)!;
+		expect(done.reason).toBe("toolUse");
+		expect(done.message.content).toEqual([
+			{ type: "toolCall", id: "call_9", name: "bash", arguments: { command: "ls" } },
+		]);
+		expect(done.message.usage).toMatchObject({ input: 4, output: 3, totalTokens: 7 });
+	});
+
+	test("replays streamed toolcall events ahead of the done event", async () => {
+		const mk = makeDeps({
+			queue: () => ({
+				events: [
+					{ type: "toolcall", call: { id: "call_7", name: "read", argumentsJson: '{"path":"a"}' } },
+					{ type: "usage", usage: STREAM_USAGE },
+				],
+				details: {
+					requestedMode: "stream",
+					actualMode: "stream",
+					downgrades: [] as DowngradeRecord[],
+				},
+			}),
+		});
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+		const events = await collect(stream);
+
+		expect(events.map((e) => e.type)).toEqual([
+			"start",
+			"toolcall_start",
+			"toolcall_delta",
+			"toolcall_end",
+			"done",
+		]);
+		const done = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
+		)!;
+		expect(done.reason).toBe("toolUse");
+	});
+});
+
 describe("createRunpodStream failures", () => {
 	test("fails the returned stream with an explicit error for an unknown model id", async () => {
 		const mk = makeDeps();

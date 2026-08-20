@@ -32,6 +32,7 @@ import {
 	type SimpleStreamOptions,
 	type TextContent,
 	type ThinkingContent,
+	type ToolCall,
 } from "@oh-my-pi/pi-ai";
 import { resolveProfileApiKey } from "./config.js";
 import type { Profile } from "./profile-schema.js";
@@ -41,6 +42,7 @@ import { isRetryableError } from "./transport/types.js";
 import type {
 	NormalizedMessage,
 	NormalizedRequest,
+	NormalizedToolCall,
 	TransportExecutionResult,
 } from "./transport/types.js";
 
@@ -161,8 +163,9 @@ function extractMessageText(content: string | readonly unknown[]): string {
 
 /**
  * Map one OMP message to the transport's normalized role/content vocabulary.
- * Image and tool-call parts are the wiring module's concern; this is the
- * faithful text projection the transport adapters encode.
+ * Image parts are the wiring module's concern; tool-call parts on assistant
+ * messages serialize as OpenAI `message.tool_calls` so the Qwen3 template can
+ * accept the following `tool`-role result.
  */
 function normalizeMessage(message: Message): NormalizedMessage {
 	switch (message.role) {
@@ -172,8 +175,17 @@ function normalizeMessage(message: Message): NormalizedMessage {
 				role: message.role === "developer" ? "system" : "user",
 				content: extractMessageText(message.content),
 			};
-		case "assistant":
-			return { role: "assistant", content: extractMessageText(message.content) };
+		case "assistant": {
+			const normalized: NormalizedMessage = {
+				role: "assistant",
+				content: extractMessageText(message.content),
+			};
+			const toolCalls = extractToolCalls(message.content);
+			if (toolCalls.length > 0) {
+				normalized.toolCalls = toolCalls;
+			}
+			return normalized;
+		}
 		case "toolResult":
 			return { role: "tool", content: extractMessageText(message.content), name: message.toolName };
 		default: {
@@ -183,6 +195,42 @@ function normalizeMessage(message: Message): NormalizedMessage {
 			throw new Error(`runpod provider: unsupported message role ${String(exhaustive)}`);
 		}
 	}
+}
+
+/**
+ * Extract OpenAI-shaped tool calls from an assistant message's content
+ * blocks: each `{type: "toolCall", id, name, arguments}` block becomes a
+ * normalized call whose arguments are JSON-stringified for the wire.
+ */
+function extractToolCalls(content: string | readonly unknown[]): NormalizedToolCall[] {
+	if (typeof content === "string") {
+		return [];
+	}
+	const calls: NormalizedToolCall[] = [];
+	for (const part of content) {
+		if (part === null || typeof part !== "object") {
+			continue;
+		}
+		const candidate = part as { type?: unknown; id?: unknown; name?: unknown; arguments?: unknown };
+		if (
+			candidate.type === "toolCall" &&
+			typeof candidate.id === "string" &&
+			candidate.id.length > 0 &&
+			typeof candidate.name === "string" &&
+			candidate.name.length > 0
+		) {
+			const args = candidate.arguments;
+			calls.push({
+				id: candidate.id,
+				name: candidate.name,
+				argumentsJson:
+					args !== undefined && typeof args === "object" && args !== null
+						? JSON.stringify(args)
+						: "{}",
+			});
+		}
+	}
+	return calls;
 }
 
 /**
@@ -216,6 +264,18 @@ function buildNormalizedRequest(
 	// caller does not pass one, so a runaway (or zombie, post-abort) task
 	// cannot burn the slot unbounded.
 	request.maxTokens = options?.maxTokens ?? profile.model.maxTokens;
+	// Forward OMP's function-tool catalog so the worker can offer tool
+	// calling; absent when the context carries no tools.
+	if (context.tools !== undefined && context.tools.length > 0) {
+		request.tools = context.tools.map((tool) => ({
+			type: "function",
+			function: {
+				name: tool.name,
+				description: tool.description,
+				parameters: tool.parameters,
+			},
+		}));
+	}
 	return request;
 }
 
@@ -312,12 +372,14 @@ function errorText(cause: unknown, secrets: readonly (string | undefined)[]): st
  * Replay a normalized transport result as a valid OMP assistant event
  * sequence: a `start`, one thinking_start/thinking_delta/thinking_end triple
  * for the response's reasoning (when present), one
- * text_start/text_delta/text_end triple per text block, and a terminal
- * `done` event whose message carries the assembled content (thinking block
- * first, then text blocks), the mapped usage (`input`/`output`/`cacheRead`/
- * `cacheWrite`/`totalTokens`), and `stopReason: "stop"`. Partial metadata
- * always carries the provider (`runpod`), model id, and API id so consumers
- * can attribute the turn.
+ * text_start/text_delta/text_end triple per text block, one
+ * toolcall_start/toolcall_delta/toolcall_end triple per completed tool call
+ * (when the worker chose to call tools), and a terminal `done` event whose
+ * message carries the assembled content (thinking, then text, then tool-call
+ * blocks), the mapped usage (`input`/`output`/`cacheRead`/`cacheWrite`/
+ * `totalTokens`), and `stopReason` — `"toolUse"` when calls are present,
+ * `"stop"` otherwise. Partial metadata always carries the provider
+ * (`runpod`), model id, and API id so consumers can attribute the turn.
  */
 function replayRunpodStream(
 	stream: AssistantMessageEventStream,
@@ -327,16 +389,23 @@ function replayRunpodStream(
 	// Ordered text blocks: a non-stream response yields its single text; a
 	// streamed result yields each text unit (and its usage) in arrival order.
 	const texts: string[] = [];
+	const toolCalls: NormalizedToolCall[] = [];
 	let reasoning = "";
 	let inputTokens = 0;
 	let outputTokens = 0;
 	let totalTokens = 0;
 
 	if (result.response !== undefined) {
-		texts.push(result.response.text);
+		// Tool-calling turns carry empty content; an empty text never
+		// produces a text block (the streamed path only emits non-empty
+		// text events anyway).
+		if (result.response.text.length > 0) {
+			texts.push(result.response.text);
+		}
 		if (result.response.reasoning !== undefined) {
 			reasoning = result.response.reasoning;
 		}
+		toolCalls.push(...(result.response.toolCalls ?? []));
 		const usage = result.response.usage;
 		if (usage !== undefined) {
 			inputTokens = usage.inputTokens;
@@ -349,6 +418,8 @@ function replayRunpodStream(
 				texts.push(event.text);
 			} else if (event.type === "reasoning") {
 				reasoning += event.text;
+			} else if (event.type === "toolcall") {
+				toolCalls.push(event.call);
 			} else if (event.type === "usage") {
 				inputTokens = event.usage.inputTokens;
 				outputTokens = event.usage.outputTokens;
@@ -357,14 +428,22 @@ function replayRunpodStream(
 		}
 	}
 
-	// Thinking precedes the answer; each block owns its content index.
-	const content: (ThinkingContent | TextContent)[] = [];
+	// Thinking precedes the answer, tool calls follow it; each block owns
+	// its content index.
+	const toolBlocks: ToolCall[] = toolCalls.map((call) => ({
+		type: "toolCall",
+		id: call.id,
+		name: call.name,
+		arguments: parseArguments(call.argumentsJson),
+	}));
+	const content: (ThinkingContent | TextContent | ToolCall)[] = [];
 	if (reasoning.length > 0) {
 		content.push({ type: "thinking", thinking: reasoning });
 	}
 	for (const text of texts) {
 		content.push({ type: "text", text });
 	}
+	content.push(...toolBlocks);
 
 	const partial: AssistantMessage = {
 		role: "assistant",
@@ -399,8 +478,35 @@ function replayRunpodStream(
 		stream.push({ type: "text_delta", contentIndex, delta: text, partial });
 		stream.push({ type: "text_end", contentIndex, content: text, partial });
 	});
+	toolBlocks.forEach((toolCall, offset) => {
+		const contentIndex = nextIndex + texts.length + offset;
+		stream.push({ type: "toolcall_start", contentIndex, partial });
+		stream.push({
+			type: "toolcall_delta",
+			contentIndex,
+			delta: toolCalls[offset]!.argumentsJson,
+			partial,
+		});
+		stream.push({ type: "toolcall_end", contentIndex, toolCall, partial });
+	});
 
-	stream.push({ type: "done", reason: "stop", message: partial });
+	stream.push({
+		type: "done",
+		reason: toolBlocks.length > 0 ? "toolUse" : "stop",
+		message: partial,
+	});
+}
+
+/** Parse a tool call's wire arguments JSON into a plain record; {} on any failure. */
+function parseArguments(json: string): Record<string, unknown> {
+	try {
+		const parsed: unknown = JSON.parse(json);
+		return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+			? (parsed as Record<string, unknown>)
+			: {};
+	} catch {
+		return {};
+	}
 }
 
 /**

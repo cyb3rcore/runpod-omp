@@ -26,6 +26,7 @@ import type {
 	NormalizedRequest,
 	NormalizedResponse,
 	NormalizedStreamEvent,
+	NormalizedToolCall,
 	NormalizedUsage,
 	RequestMode,
 	TransportDeps,
@@ -189,19 +190,22 @@ async function httpError(response: Response): Promise<Error> {
 }
 
 /**
- * Parse an SSE document into normalized text/reasoning/usage events plus the
- * aggregated response text. `data:` frames are JSON OpenAI chat-completion
- * chunks: `choices[0].delta.content` becomes a text event,
+ * Parse an SSE document into normalized text/reasoning/toolcall/usage events
+ * plus the aggregated response. `data:` frames are JSON OpenAI
+ * chat-completion chunks: `choices[0].delta.content` becomes a text event,
  * `choices[0].delta.reasoning_content` becomes a reasoning event (and the
- * response reasoning), a chunk's usage becomes a usage event (and the
- * response usage), and `[DONE]` is ignored. Frames that are neither `[DONE]`
- * nor valid JSON are an explicit error — never guessed into a successful
- * answer.
+ * response reasoning), `choices[0].delta.tool_calls` are accumulated by
+ * index into completed calls (a call's `id`/`function.name` arrive on the
+ * first fragment and `function.arguments` arrives split across fragments),
+ * a chunk's usage becomes a usage event (and the response usage), and
+ * `[DONE]` is ignored. Frames that are neither `[DONE]` nor valid JSON are
+ * an explicit error — never guessed into a successful answer.
  */
 function parseSse(bodyText: string): {
 	events: NormalizedStreamEvent[];
 	text: string;
 	reasoning?: string;
+	toolCalls?: NormalizedToolCall[];
 	usage?: NormalizedUsage;
 } {
 	const events: NormalizedStreamEvent[] = [];
@@ -210,6 +214,10 @@ function parseSse(bodyText: string): {
 	let usage: NormalizedUsage | undefined;
 	let frame = "";
 	let frameHasData = false;
+
+	// Index-keyed tool-call fragments: id/name arrive on the first delta for
+	// an index, arguments arrive split across subsequent deltas.
+	const toolCallParts = new Map<number, { id?: string; name?: string; argumentsJson: string }>();
 
 	const flushFrame = (): void => {
 		if (!frameHasData) {
@@ -245,6 +253,7 @@ function parseSse(bodyText: string): {
 							events.push({ type: "text", text: delta.content });
 							text += delta.content;
 						}
+						accumulateToolCallFragments(delta.tool_calls, toolCallParts);
 					}
 				}
 			}
@@ -280,7 +289,55 @@ function parseSse(bodyText: string): {
 	}
 	flushFrame();
 
-	return { events, text, reasoning, usage };
+	// Finalize every index that accumulated a complete call (id + name).
+	const toolCalls: NormalizedToolCall[] = [];
+	for (const [index, parts] of [...toolCallParts.entries()].sort((a, b) => a[0] - b[0])) {
+		if (parts.id !== undefined && parts.name !== undefined) {
+			const call: NormalizedToolCall = { id: parts.id, name: parts.name, argumentsJson: parts.argumentsJson };
+			toolCalls.push(call);
+			events.push({ type: "toolcall", call });
+		} else {
+			// An index that never received id/name is an incomplete call — it
+			// is dropped rather than guessed, but only after the finalization
+			// loop so partial fragments never leak as calls.
+			void index;
+		}
+	}
+
+	return { events, text, reasoning, toolCalls, usage };
+}
+
+/**
+ * Merge one `delta.tool_calls` payload into the index-keyed fragment map.
+ * Each entry is `{index, id?, type?, function?: {name?, arguments?}}`; the
+ * `arguments` fragments for an index are concatenated in arrival order.
+ */
+function accumulateToolCallFragments(
+	input: unknown,
+	parts: Map<number, { id?: string; name?: string; argumentsJson: string }>,
+): void {
+	if (!Array.isArray(input)) {
+		return;
+	}
+	for (const entry of input) {
+		if (!isRecord(entry) || typeof entry.index !== "number") {
+			continue;
+		}
+		const existing = parts.get(entry.index) ?? { argumentsJson: "" };
+		if (typeof entry.id === "string" && entry.id.length > 0) {
+			existing.id = entry.id;
+		}
+		const fn = isRecord(entry.function) ? entry.function : undefined;
+		if (fn !== undefined) {
+			if (typeof fn.name === "string" && fn.name.length > 0) {
+				existing.name = fn.name;
+			}
+			if (typeof fn.arguments === "string" && fn.arguments.length > 0) {
+				existing.argumentsJson += fn.arguments;
+			}
+		}
+		parts.set(entry.index, existing);
+	}
 }
 
 /** Decode a JSON completion body with the openai-shaped adapter. */
@@ -318,10 +375,13 @@ async function parseSseResponse(
 	} catch (error) {
 		throw failure(error, "response read");
 	}
-	const { events, text, reasoning, usage } = parseSse(bodyText);
+	const { events, text, reasoning, toolCalls, usage } = parseSse(bodyText);
 	const responseBody: NormalizedResponse = { text, downgrades: [] };
 	if (reasoning !== undefined && reasoning.length > 0) {
 		responseBody.reasoning = reasoning;
+	}
+	if (toolCalls !== undefined && toolCalls.length > 0) {
+		responseBody.toolCalls = toolCalls;
 	}
 	if (usage !== undefined) {
 		responseBody.usage = usage;

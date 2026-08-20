@@ -15,6 +15,26 @@ export interface NormalizedMessage {
 	role: "system" | "user" | "assistant" | "tool";
 	content: string;
 	name?: string;
+	/** Assistant wire tool calls (OpenAI `message.tool_calls`), preserved for round-trips. */
+	toolCalls?: NormalizedToolCall[];
+}
+
+/** OpenAI function-tool definition forwarded from OMP's `Context.tools`. */
+export interface NormalizedTool {
+	type: "function";
+	function: {
+		name: string;
+		description?: string;
+		parameters?: unknown;
+	};
+}
+
+/** A completed tool call decoded from the worker response. */
+export interface NormalizedToolCall {
+	id: string;
+	name: string;
+	/** The arguments payload exactly as the worker emitted it (JSON text). */
+	argumentsJson: string;
 }
 
 /** Normalized request handed to a transport adapter. */
@@ -24,6 +44,8 @@ export interface NormalizedRequest {
 	stream: boolean;
 	temperature?: number;
 	maxTokens?: number;
+	/** Function-tool definitions; absent when the context carried no tools. */
+	tools?: NormalizedTool[];
 }
 
 /** Token accounting mapped from the wire format's own usage shape. */
@@ -44,6 +66,7 @@ export interface DowngradeRecord {
 export type NormalizedStreamEvent =
 	| { type: "text"; text: string }
 	| { type: "reasoning"; text: string }
+	| { type: "toolcall"; call: NormalizedToolCall }
 	| { type: "tool"; name: string; argumentsJson?: string; result?: string }
 	| { type: "usage"; usage: NormalizedUsage }
 	| { type: "downgrade"; record: DowngradeRecord };
@@ -51,11 +74,13 @@ export type NormalizedStreamEvent =
 /**
  * Normalized result of a transport call; usage is omitted when absent, and
  * `reasoning` carries the model's thinking text (e.g. OpenAI `reasoning_content`)
- * when the worker emits it separately from the answer.
+ * when the worker emits it separately from the answer. `toolCalls` carries
+ * completed function calls when the worker chose to call tools.
  */
 export interface NormalizedResponse {
 	text: string;
 	reasoning?: string;
+	toolCalls?: NormalizedToolCall[];
 	usage?: NormalizedUsage;
 	downgrades: DowngradeRecord[];
 }
