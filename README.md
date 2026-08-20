@@ -110,6 +110,74 @@ profiles:
       supportsVision: true
 ```
 
+### Example: main + subs (load-balanced, two concurrency profiles)
+
+A production pattern is one model exposed through two Runpod load-balanced
+endpoints with different concurrency budgets: a **main** profile for the coding
+agent (long context, one slot) and a **subs** profile for parallel subagents
+(many slots, bounded context). Both point at the same GGUF-backed llama.cpp
+server image, differing only in the endpoint's server-side `CTX_SIZE` /
+`PARALLEL` environment and the profile's `contextWindow`.
+
+```yaml
+version: 1
+profiles:
+  qwen3.8-27b:
+    endpointType: load-balanced
+    invokeUrl: https://<main-endpoint>.api.runpod.ai
+    apiKey: env:RUNPOD_API_KEY
+    model:
+      id: Qwen3.8-27B-UD-Q8_K_XL
+      name: Qwen3.8 27B (Runpod)
+      contextWindow: 262144
+      maxTokens: 12288
+      reasoning: true
+      input: [text, image]
+      supportsTools: false
+      supportsVision: true
+    request:
+      mode: sync
+      loadBalancedPath: /v1/chat/completions
+
+  qwen3.8-subs:
+    endpointType: load-balanced
+    invokeUrl: https://<subs-endpoint>.api.runpod.ai
+    apiKey: env:RUNPOD_API_KEY
+    model:
+      id: Qwen3.8-27B-UD-Q8_K_XL
+      name: Qwen3.8 27B (Runpod subs)
+      contextWindow: 40960
+      maxTokens: 8192
+      reasoning: true
+      input: [text, image]
+      supportsTools: false
+      supportsVision: true
+    request:
+      mode: sync
+      loadBalancedPath: /v1/chat/completions
+```
+
+The server-side concurrency split is enforced by the endpoint, not the profile:
+the main endpoint runs `PARALLEL=1, CTX_SIZE=262144` (one long-carrying slot),
+while the subs endpoint runs `PARALLEL=8, CTX_SIZE=40960, requestCount=8`
+(eight 40 K slots per worker, scaling to a second worker only when all eight are
+busy — a 16-concurrency ceiling). The profile's `contextWindow` must match the
+endpoint's `CTX_SIZE`: KV cache is `slots × ctx`, so raising parallelism
+necessarily caps usable context per slot.
+
+**Recommended: serve the weights via Runpod's model-cache, not a baked image.**
+Keep the worker image light (runtime + llama.cpp; no model baked), and in the
+endpoint's console **Model** field set a **private Hugging Face repo that holds
+only the single quant GGUF and its mmproj**. Reason: Runpod's cache currently
+downloads *every* file in the referenced repo, so pointing it at a kitchen-sink
+quant repo (e.g. `unsloth/Qwen3.8-27B-GGUF`, ~416 GB across 30 files) is a trap —
+mirror just the two files you serve into your own repo so the cache pulls
+`GGUF + mmproj` only. Workers then boot warm from
+`/runpod-volume/huggingface-cache/hub/models--<org>--<name>/snapshots/<hash>/`
+with no per-worker re-download. For a private repo, the profile's `apiKey` is
+unrelated; the endpoint needs the HF token (console gated-model field or
+`HF_TOKEN` endpoint env) with read access to that repo.
+
 ### Schema
 
 Every field under `model` is **required** (no model-level defaults). `request`
