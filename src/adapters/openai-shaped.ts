@@ -74,26 +74,45 @@ export function decodeOpenAiShaped(output: unknown): NormalizedResponse {
 	}
 
 	if (output.usage !== undefined) {
-		if (!isRecord(output.usage)) {
+		const usage = parseOpenAiUsage(output.usage);
+		if (usage === undefined) {
 			throw new UnsupportedOutputShapeError(EXPECTED_SHAPE);
 		}
-		const { prompt_tokens, completion_tokens, total_tokens } = output.usage;
-		if (
-			typeof prompt_tokens !== "number" ||
-			typeof completion_tokens !== "number" ||
-			typeof total_tokens !== "number"
-		) {
-			throw new UnsupportedOutputShapeError(EXPECTED_SHAPE);
-		}
-		const usage: NormalizedUsage = {
-			inputTokens: prompt_tokens,
-			outputTokens: completion_tokens,
-			totalTokens: total_tokens,
-		};
 		response.usage = usage;
 	}
 
 	return response;
+}
+
+/**
+ * Parse an OpenAI `usage` object into a normalized usage, preserving
+ * llama.cpp's prompt-cache hit count (`usage.prompt_tokens_details.cached_tokens`)
+ * as `cacheReadTokens` when present. Returns undefined for anything that is
+ * not an object with numeric prompt/completion/total token counts.
+ */
+export function parseOpenAiUsage(value: unknown): NormalizedUsage | undefined {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+	const { prompt_tokens, completion_tokens, total_tokens } = value;
+	if (
+		typeof prompt_tokens !== "number" ||
+		typeof completion_tokens !== "number" ||
+		typeof total_tokens !== "number"
+	) {
+		return undefined;
+	}
+	const usage: NormalizedUsage = {
+		inputTokens: prompt_tokens,
+		outputTokens: completion_tokens,
+		totalTokens: total_tokens,
+	};
+	const details = isRecord(value.prompt_tokens_details) ? value.prompt_tokens_details : undefined;
+	const cached = details?.cached_tokens;
+	if (typeof cached === "number" && Number.isFinite(cached) && cached >= 0) {
+		usage.cacheReadTokens = cached;
+	}
+	return usage;
 }
 
 /**

@@ -58,6 +58,12 @@ export interface NormalizedUsage {
 	inputTokens: number;
 	outputTokens: number;
 	totalTokens: number;
+	/**
+	 * Conversation prompt tokens served from the worker's prompt/KV cache
+	 * (llama.cpp `usage.prompt_tokens_details.cached_tokens`), when the wire
+	 * reports them. Absent means unknown, not zero.
+	 */
+	cacheReadTokens?: number;
 }
 
 /** Why a transport fell back from the requested mode to another one. */
@@ -206,6 +212,19 @@ export interface TransportExecutionResult {
 	/** Streamed units in arrival order; empty for non-stream executions. */
 	events: NormalizedStreamEvent[];
 	details: TransportDetails;
+	/**
+	 * Wall-clock ms of the inference exchange (request start → result),
+	 * measured with the transport's clock. Set by the load-balanced (and
+	 * pod-delegated) transport; absent for the managed queue, whose span
+	 * includes queue wait and would misstate the generation rate.
+	 */
+	durationMs?: number;
+	/**
+	 * Wall-clock ms from the exchange start to the first response bytes
+	 * (streaming direct exchanges only; the first SSE chunk). Absent for
+	 * whole-body responses, where there is no incremental arrival to time.
+	 */
+	ttftMs?: number;
 }
 
 /**

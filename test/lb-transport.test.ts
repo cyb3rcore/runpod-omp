@@ -209,13 +209,36 @@ describe("executeLoadBalancedTransport", () => {
 		expect(result.details).toEqual({ requestedMode: "stream", actualMode: "stream", downgrades: [] });
 	});
 
-	test("preserves SSE reasoning_content events ahead of text and aggregates them", async () => {
+	test("preserves prompt-cache hits from a JSON completion usage block", async () => {
+		const { fetchMock } = recordingFetch(() =>
+			jsonResponse({
+				choices: [{ message: { role: "assistant", content: "cached" } }],
+				usage: {
+					prompt_tokens: 12,
+					completion_tokens: 5,
+					total_tokens: 17,
+					prompt_tokens_details: { cached_tokens: 7 },
+				},
+			}),
+		);
+
+		const result = await executeLoadBalancedTransport(lbProfile(), requestFixture(), { fetch: fetchMock });
+
+		expect(result.response!.usage).toEqual({
+			inputTokens: 12,
+			outputTokens: 5,
+			totalTokens: 17,
+			cacheReadTokens: 7,
+		});
+	});
+
+	test("preserves prompt-cache hits from a streamed usage chunk", async () => {
 		const sseBody = [
-			'data: {"choices":[{"delta":{"reasoning_content":"Let me"},"index":0}]}',
+			'data: {"choices":[{"delta":{"content":"Hello"},"index":0}]}',
 			"",
-			'data: {"choices":[{"delta":{"reasoning_content":" think."},"index":0}]}',
+			'data: {"choices":[{"delta":{},"index":0}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17,"prompt_tokens_details":{"cached_tokens":7}},"finish_reason":"stop"}',
 			"",
-			'data: {"choices":[{"delta":{"content":"Answer."},"index":0}]}',
+			"data: [DONE]",
 			"",
 		].join("\n");
 		const { fetchMock } = recordingFetch(
@@ -228,17 +251,46 @@ describe("executeLoadBalancedTransport", () => {
 			{ fetch: fetchMock },
 		);
 
-		// Reasoning units and text units are each preserved as distinct events.
-		expect(result.events).toEqual([
-			{ type: "reasoning", text: "Let me" },
-			{ type: "reasoning", text: " think." },
-			{ type: "text", text: "Answer." },
-		]);
-		expect(result.response).toEqual({
-			text: "Answer.",
-			reasoning: "Let me think.",
-			downgrades: [],
+		expect(result.events.find((event) => event.type === "usage")).toEqual({
+			type: "usage",
+			usage: { inputTokens: 12, outputTokens: 5, totalTokens: 17, cacheReadTokens: 7 },
 		});
+		expect(result.response!.usage).toEqual({
+			inputTokens: 12,
+			outputTokens: 5,
+			totalTokens: 17,
+			cacheReadTokens: 7,
+		});
+	});
+
+	test("reports duration and TTFT for streamed exchanges", async () => {
+		const sseBody = ['data: {"choices":[{"delta":{"content":"Hi"},"index":0}]}', ""].join("\n");
+		const { fetchMock } = recordingFetch(
+			() => new Response(sseBody, { status: 200, headers: { "content-type": "text/event-stream" } }),
+		);
+
+		const result = await executeLoadBalancedTransport(
+			lbProfile({ mode: "stream" }),
+			requestFixture({ stream: true }),
+			{ fetch: fetchMock },
+		);
+
+		expect(typeof result.durationMs).toBe("number");
+		expect(result.durationMs!).toBeGreaterThanOrEqual(0);
+		expect(typeof result.ttftMs).toBe("number");
+		expect(result.ttftMs!).toBeGreaterThanOrEqual(0);
+		expect(result.ttftMs!).toBeLessThanOrEqual(result.durationMs!);
+	});
+
+	test("reports duration for non-stream exchanges and no TTFT", async () => {
+		const { fetchMock } = recordingFetch(() =>
+			jsonResponse({ choices: [{ message: { content: "ok" } }] }),
+		);
+
+		const result = await executeLoadBalancedTransport(lbProfile(), requestFixture(), { fetch: fetchMock });
+
+		expect(typeof result.durationMs).toBe("number");
+		expect(result.ttftMs).toBeUndefined();
 	});
 
 	test("decodes reasoning_content from a JSON completion body", async () => {

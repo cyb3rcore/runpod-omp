@@ -431,12 +431,14 @@ function responseSummary(result: TransportExecutionResult): Record<string, unkno
 	let toolCalls = 0;
 	let inputTokens: number | undefined;
 	let outputTokens: number | undefined;
+	let cacheReadTokens: number | undefined;
 	if (result.response !== undefined) {
 		textChars = result.response.text.length;
 		reasoningChars = result.response.reasoning?.length ?? 0;
 		toolCalls = result.response.toolCalls?.length ?? 0;
 		inputTokens = result.response.usage?.inputTokens;
 		outputTokens = result.response.usage?.outputTokens;
+		cacheReadTokens = result.response.usage?.cacheReadTokens;
 	} else {
 		for (const event of result.events) {
 			if (event.type === "text") {
@@ -448,6 +450,7 @@ function responseSummary(result: TransportExecutionResult): Record<string, unkno
 			} else if (event.type === "usage") {
 				inputTokens = event.usage.inputTokens;
 				outputTokens = event.usage.outputTokens;
+				cacheReadTokens = event.usage.cacheReadTokens;
 			}
 		}
 	}
@@ -456,6 +459,7 @@ function responseSummary(result: TransportExecutionResult): Record<string, unkno
 		...(reasoningChars > 0 ? { reasoningChars } : {}),
 		...(toolCalls > 0 ? { toolCalls } : {}),
 		...(inputTokens !== undefined ? { inputTokens, outputTokens } : {}),
+		...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
 	};
 }
 
@@ -496,6 +500,7 @@ function replayRunpodStream(
 	let inputTokens = 0;
 	let outputTokens = 0;
 	let totalTokens = 0;
+	let cacheReadTokens: number | undefined;
 
 	if (result.response !== undefined) {
 		// Tool-calling turns carry empty content; an empty text never
@@ -513,6 +518,7 @@ function replayRunpodStream(
 			inputTokens = usage.inputTokens;
 			outputTokens = usage.outputTokens;
 			totalTokens = usage.totalTokens;
+			cacheReadTokens = usage.cacheReadTokens;
 		}
 	} else {
 		for (const event of result.events) {
@@ -526,6 +532,7 @@ function replayRunpodStream(
 				inputTokens = event.usage.inputTokens;
 				outputTokens = event.usage.outputTokens;
 				totalTokens = event.usage.totalTokens;
+				cacheReadTokens = event.usage.cacheReadTokens;
 			}
 		}
 	}
@@ -556,13 +563,18 @@ function replayRunpodStream(
 		usage: {
 			input: inputTokens,
 			output: outputTokens,
-			cacheRead: 0,
+			cacheRead: cacheReadTokens ?? 0,
 			cacheWrite: 0,
 			totalTokens,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "stop",
 		timestamp: Date.now(),
+		// The direct (load-balanced/pod) transports measure the exchange span
+		// and first-byte time; queue transports omit both, so the tooltip
+		// keeps showing the rate/TTFT only where they are honest.
+		...(result.durationMs !== undefined ? { duration: result.durationMs } : {}),
+		...(result.ttftMs !== undefined ? { ttft: result.ttftMs } : {}),
 	};
 
 	stream.push({ type: "start", partial });
@@ -717,6 +729,10 @@ export function createRunpodStream(
 								attempt: attempt + 1,
 								candidate: candidate.model.id,
 								durationMs: Date.now() - attemptStartedAt,
+								...(result.durationMs !== undefined
+									? { transportDurationMs: result.durationMs }
+									: {}),
+								...(result.ttftMs !== undefined ? { ttftMs: result.ttftMs } : {}),
 								response: responseSummary(result),
 							});
 							replayRunpodStream(stream, result, candidate);

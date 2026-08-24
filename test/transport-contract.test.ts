@@ -101,16 +101,34 @@ describe("openai-shaped adapter", () => {
 		});
 	});
 
-	test("decodeOpenAiShaped handles completions without a usage block", () => {
+	test("decodeOpenAiShaped preserves llama.cpp prompt-cache hits as cacheReadTokens", () => {
 		const completion = {
-			choices: [{ message: { role: "assistant", content: "no usage here" } }],
+			choices: [{ message: { role: "assistant", content: "cached answer" } }],
+			usage: {
+				prompt_tokens: 12,
+				completion_tokens: 5,
+				total_tokens: 17,
+				prompt_tokens_details: { cached_tokens: 7 },
+			},
 		};
 
-		const response = decodeOpenAiShaped(completion);
+		expect(decodeOpenAiShaped(completion).usage).toEqual({
+			inputTokens: 12,
+			outputTokens: 5,
+			totalTokens: 17,
+			cacheReadTokens: 7,
+		});
+	});
 
-		expect(response.text).toBe("no usage here");
-		expect(response.downgrades).toEqual([]);
-		expect("usage" in response).toBe(false);
+	test("decodeOpenAiShaped omits cacheReadTokens when the wire reports no cache details", () => {
+		const completion = {
+			choices: [{ message: { role: "assistant", content: "no cache" } }],
+			usage: { prompt_tokens: 4, completion_tokens: 3, total_tokens: 7 },
+		};
+
+		const usage = decodeOpenAiShaped(completion).usage;
+		expect(usage).toEqual({ inputTokens: 4, outputTokens: 3, totalTokens: 7 });
+		expect(Object.keys(usage!)).toEqual(["inputTokens", "outputTokens", "totalTokens"]);
 	});
 
 	test("decodeOpenAiShaped rejects non-OpenAI output shapes with an explicit error", () => {

@@ -19,7 +19,7 @@
  * stay empty — there is no queue to fall back to.
  */
 
-import { decodeOpenAiShaped } from "../adapters/openai-shaped.js";
+import { decodeOpenAiShaped, parseOpenAiUsage } from "../adapters/openai-shaped.js";
 import { isRecord, type Profile } from "../profile-schema.js";
 import { UnsupportedOutputShapeError, defaultTransportDeps, markRetryable } from "./types.js";
 import {
@@ -240,22 +240,15 @@ function parseSse(bodyText: string): {
 					}
 				}
 			}
-			if (isRecord(chunk.usage)) {
-				const { prompt_tokens, completion_tokens, total_tokens } = chunk.usage;
-				if (
-					typeof prompt_tokens === "number" &&
-					typeof completion_tokens === "number" &&
-					typeof total_tokens === "number"
-				) {
-					const mapped: NormalizedUsage = {
-						inputTokens: prompt_tokens,
-						outputTokens: completion_tokens,
-						totalTokens: total_tokens,
-					};
-					usage = mapped;
-					events.push({ type: "usage", usage: mapped });
-				}
+					if (isRecord(chunk.usage)) {
+			// Same mapping as the JSON decoder, including llama.cpp's
+			// prompt-cache hits (`prompt_tokens_details.cached_tokens`).
+			const mapped = parseOpenAiUsage(chunk.usage);
+			if (mapped !== undefined) {
+				usage = mapped;
+				events.push({ type: "usage", usage: mapped });
 			}
+		}
 		}
 	};
 
@@ -328,6 +321,8 @@ async function parseJsonResponse(
 	response: Response,
 	mode: RequestMode,
 	failure: FailureFactory,
+	now: () => number,
+	startedAt: number,
 ): Promise<TransportExecutionResult> {
 	let body: unknown;
 	try {
@@ -343,7 +338,52 @@ async function parseJsonResponse(
 		events: [],
 		// Mode labels only — the queue-only jobId/status/depth fields never appear.
 		details: { requestedMode: mode, actualMode: mode, downgrades: [] },
+		durationMs: now() - startedAt,
 	};
+}
+
+/**
+ * Read a response body to its end, recording when the first bytes arrived.
+ * Whole-body responses (non-streaming, body-less doubles) yield no
+ * first-byte time; the streaming path uses it as the time-to-first-token.
+ */
+async function readBody(
+	response: Response,
+	failure: FailureFactory,
+	now: () => number,
+): Promise<{ bodyText: string; firstContentAt?: number }> {
+	// Some Response implementations (e.g. compressed or test-double bodies)
+	// expose no stream; text() then carries the read and no TTFT is measured.
+	const body = response.body;
+	if (body === null) {
+		let bodyText: string;
+		try {
+			bodyText = await response.text();
+		} catch (error) {
+			throw failure(error, "response read");
+		}
+		return { bodyText };
+	}
+	const reader = body.getReader();
+	const decoder = new TextDecoder();
+	let bodyText = "";
+	let firstContentAt: number | undefined;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) {
+				break;
+			}
+			if (firstContentAt === undefined && value.byteLength > 0) {
+				firstContentAt = now();
+			}
+			bodyText += decoder.decode(value, { stream: true });
+		}
+		bodyText += decoder.decode();
+	} catch (error) {
+		throw failure(error, "response read");
+	}
+	return { bodyText, firstContentAt };
 }
 
 /** Parse an SSE completion stream into text events plus the aggregated response. */
@@ -351,13 +391,10 @@ async function parseSseResponse(
 	response: Response,
 	mode: RequestMode,
 	failure: FailureFactory,
+	now: () => number,
+	startedAt: number,
 ): Promise<TransportExecutionResult> {
-	let bodyText: string;
-	try {
-		bodyText = await response.text();
-	} catch (error) {
-		throw failure(error, "response read");
-	}
+	const { bodyText, firstContentAt } = await readBody(response, failure, now);
 	const { events, text, reasoning, toolCalls, usage } = parseSse(bodyText);
 	const responseBody: NormalizedResponse = { text, downgrades: [] };
 	if (reasoning !== undefined && reasoning.length > 0) {
@@ -369,11 +406,16 @@ async function parseSseResponse(
 	if (usage !== undefined) {
 		responseBody.usage = usage;
 	}
-	return {
+	const result: TransportExecutionResult = {
 		response: responseBody,
 		events,
 		details: { requestedMode: mode, actualMode: mode, downgrades: [] },
+		durationMs: now() - startedAt,
 	};
+	if (firstContentAt !== undefined) {
+		result.ttftMs = firstContentAt - startedAt;
+	}
+	return result;
 }
 
 /**
@@ -401,6 +443,7 @@ export async function executeLoadBalancedTransport(
 
 	const fetchImpl = deps.fetch ?? defaultTransportDeps.fetch;
 	const url = joinUrl(profile.invokeUrl, profile.request.loadBalancedPath);
+	const now = deps.now ?? defaultTransportDeps.now;
 
 	const headers: Record<string, string> = { "content-type": "application/json" };
 	const token = resolveBearerToken(profile, deps);
@@ -430,10 +473,11 @@ export async function executeLoadBalancedTransport(
 		}
 
 		const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+		const startedAt = now();
 		if (contentType.includes("text/event-stream")) {
-			return await parseSseResponse(response, profile.request.mode, failure);
+			return await parseSseResponse(response, profile.request.mode, failure, now, startedAt);
 		}
-		return await parseJsonResponse(response, profile.request.mode, failure);
+		return await parseJsonResponse(response, profile.request.mode, failure, now, startedAt);
 	} finally {
 		scope.dispose();
 	}

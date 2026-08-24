@@ -468,6 +468,49 @@ describe("createRunpodStream event replay", () => {
 			{ type: "text", text: " world" },
 		]);
 	});
+
+	test("stamps duration, ttft, and cache-read tokens on the done message", async () => {
+		const mk = makeDeps({
+			loadBalanced: () => ({
+				events: [
+					{ type: "text", text: "cached reply" },
+					{
+						type: "usage",
+						usage: { inputTokens: 12, outputTokens: 5, totalTokens: 17, cacheReadTokens: 7 },
+					},
+				],
+				details: { requestedMode: "stream", actualMode: "stream", downgrades: [] as DowngradeRecord[] },
+				durationMs: 9_000,
+				ttftMs: 4_500,
+			}),
+		});
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(LB), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const events = await collect(stream);
+		const done = events.find(
+			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
+		)!;
+		expect(done.message.duration).toBe(9_000);
+		expect(done.message.ttft).toBe(4_500);
+		expect(done.message.usage).toMatchObject({
+			input: 12,
+			output: 5,
+			cacheRead: 7,
+			cacheWrite: 0,
+			totalTokens: 17,
+		});
+	});
+
+	test("omits duration and ttft when the transport reports none", async () => {
+		const mk = makeDeps();
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const done = (await collect(stream)).find(
+			(e): e is Extract<AssistantMessageEvent, { type: "done" }> => e.type === "done",
+		)!;
+		expect(done.message.duration).toBeUndefined();
+		expect(done.message.ttft).toBeUndefined();
+	});
 });
 
 describe("createRunpodStream system-message normalization", () => {
