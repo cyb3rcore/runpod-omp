@@ -1,3 +1,24 @@
+## 1.4.0
+
+- **feat:** filter forwarded tools with request.toolAllowlist (`0a3abc3`)
+  - Add an optional per-profile allowlist of tool names; when set, only those tools are sent to the worker.
+- Lets profiles trim the tool surface the model sees.
+
+- **fix:** keep object properties named pattern/format in tool schemas (`ec5c36f`)
+  - Strip `pattern`/`format` only when they are JSON-Schema constraint keywords (string values).
+- Tool parameters that merely share the name, like grep's required `pattern`, are forwarded verbatim so the model emits the call with its required argument.
+
+- **fix:** report prompt-cache hits and real exchange timing (`980db13`)
+  - Surface llama.cpp's prompt-cache hits as cache-read tokens in the usage tooltip instead of a hardcoded zero.
+- Measure direct (load-balanced) exchanges end to end and report time-to-first-token, so the token-rate and TTFT tooltip shows real numbers.
+- Queue transports intentionally omit timing, because queue wait would corrupt the reported rate.
+
+- **docs:** mirror the live subs pod profile in the pod example (`7bbea5a`)
+  The pod example now matches the deployed subs pod: keyless worker (no pod.inferenceApiKey), policy maxAttempts: 3, model name, and a note that the id is the live pod's. Mirror maxAttempts: 3 in the load-balanced example too.
+
+- **docs:** restructure for fast scanning — endpoint decision table, collapsible examples, corrected cost claims (`1b3a1e0`)
+  Add a 'Which endpoint type?' decision table (queue / load-balanced / pod) and a table of contents so both serverless and pod readers find their path immediately. Collapse the three full YAML examples into <details> blocks. Remove the stale status-line claims (the refresher is disabled pending OMP's inline-segment API), drop the duplicated health-probes section, and tighten prose throughout.
+
 ## 1.3.0
 
 - **feat:** pod profile support — TCP address derivation, lifecycle commands, pod tool, cost (`54fa4cf`)
