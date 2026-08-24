@@ -58,9 +58,9 @@ export async function executeQueueTransport(
 	request: NormalizedRequest,
 	deps: TransportDeps = {},
 ): Promise<TransportExecutionResult> {
-	if (profile.endpointType !== "queue") {
+	if (profile.invokeUrl === undefined) {
 		throw new Error(
-			`Runpod queue transport requires a queue endpoint profile (endpointType "${profile.endpointType}")`,
+			`Runpod queue transport requires a profile invokeUrl (endpointType "${profile.endpointType}")`,
 		);
 	}
 

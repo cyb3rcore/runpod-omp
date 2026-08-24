@@ -34,7 +34,11 @@ export type ControlOperation =
 	| "logs"
 	| "warm"
 	| "cool"
-	| "close";
+	| "close"
+	| "pod-status"
+	| "pod-start"
+	| "pod-stop"
+	| "pod-restart";
 
 /** The slice of a profile a control operation needs. */
 export interface ControlProfile {
@@ -43,6 +47,8 @@ export interface ControlProfile {
 	apiKey?: SecretReference;
 	/** Base URL for REST v2 control-plane routes; defaults to RUNPOD_CONTROL_BASE. */
 	controlBaseUrl?: string;
+	/** Explicit pod id for pod-profile operations; never derived from invokeUrl. */
+	podId?: string;
 }
 
 /** What to do, plus any job-scoped id. */
@@ -93,8 +99,41 @@ export type ControlOutcome =
 	| { ok: true; operation: "workers"; workers: ControlWorker[] }
 	| { ok: true; operation: "catalog"; gpus: Record<string, number> }
 	| { ok: true; operation: "billing"; records: ServerlessBillingRecord[] }
+	| { ok: true; operation: "pod-status"; pod: NormalizedPodStatus }
+	| { ok: true; operation: "pod-start" | "pod-stop" | "pod-restart"; pod: NormalizedPodStatus }
 	| { ok: false; operation: ControlOperation; supported: false; reason: string }
 	| { ok: false; operation: ControlOperation; supported: true; detail: string };
+
+/** Pod lifecycle states reported by the REST v2 pod API. */
+export type PodLifecycleStatus =
+	| "PROVISIONING"
+	| "STARTING"
+	| "RUNNING"
+	| "EXITED"
+	| "ERROR"
+	| "TERMINATED";
+
+/** The pod lifecycle states accepted by the pod API parser. */
+const POD_LIFECYCLE_STATUSES: readonly PodLifecycleStatus[] = [
+	"PROVISIONING",
+	"STARTING",
+	"RUNNING",
+	"EXITED",
+	"ERROR",
+	"TERMINATED",
+];
+
+/** Normalized live pod state for the command/tool/cost surfaces. */
+export interface NormalizedPodStatus {
+	id: string;
+	name: string;
+	status: PodLifecycleStatus;
+	/** USD/hour while running; 0 when stopped (EXITED/TERMINATED). */
+	costPerHour: number;
+	/** Seconds the pod has been running; null when not RUNNING. */
+	uptimeSeconds: number | null;
+	dataCenterId: string | null;
+}
 
 /** One active serverless worker, as reported by the REST v2 control plane. */
 export interface ControlWorker {
@@ -311,10 +350,84 @@ async function runQueueOperation(
 }
 
 /**
+ * Lenient parse of a bare Pod object (as returned by `GET /v2/pods/{id}` and
+ * the `POST /v2/pods/{id}/action` transitions) into normalized status.
+ */
+function parsePodStatus(input: unknown): NormalizedPodStatus {
+	const pod = isObject(input) ? input : {};
+	const runtime = isObject(pod["runtime"]) ? pod["runtime"] : {};
+	const uptime = runtime["uptime"];
+	const statusValue = pod["status"];
+	return {
+		id: typeof pod["id"] === "string" ? pod["id"] : "",
+		name: typeof pod["name"] === "string" ? pod["name"] : "",
+		status:
+			POD_LIFECYCLE_STATUSES.find((candidate) => candidate === statusValue) ?? "ERROR",
+		costPerHour: finiteNumber(pod["cost"], 0),
+		uptimeSeconds:
+			typeof uptime === "number" && Number.isFinite(uptime) ? uptime : null,
+		dataCenterId: typeof pod["dataCenterId"] === "string" ? pod["dataCenterId"] : null,
+	};
+}
+
+/**
+ * Run a pod control-plane operation (status/start/stop/restart) against the
+ * REST v2 pod API. `pod-status` reads the pod; the transition operations POST
+ * the matching action and return the updated pod. Auth uses the resolved
+ * control key; non-2xx responses map to a redacted failure (403 names the
+ * scope requirement).
+ */
+async function runPodOperation(
+	profile: ControlProfile,
+	input: ControlInput & {
+		operation: "pod-status" | "pod-start" | "pod-stop" | "pod-restart";
+	},
+	deps: ControlDeps,
+): Promise<ControlOutcome> {
+	const { operation } = input;
+	const podId = profile.podId;
+	if (podId === undefined) {
+		return failure(operation, "pod id missing from the profile");
+	}
+
+	const key = profile.apiKey === undefined ? undefined : deps.resolveKey(profile.apiKey);
+	if (key === undefined) {
+		return failure(operation, "Pod control requires an API key that could not be resolved.");
+	}
+	const headers = { authorization: `Bearer ${key}` };
+	const base = profile.controlBaseUrl ?? RUNPOD_CONTROL_BASE;
+	const { fetch } = deps;
+
+	try {
+		let res: Response;
+		if (operation === "pod-status") {
+			res = await fetch(`${base}/v2/pods/${podId}`, { method: "GET", headers });
+		} else {
+			const action = operation.slice("pod-".length);
+			res = await fetch(`${base}/v2/pods/${podId}/action`, {
+				method: "POST",
+				headers: { ...headers, "content-type": "application/json" },
+				body: JSON.stringify({ action }),
+			});
+		}
+		if (res.status === 403) {
+			return failure(operation, "control-plane access denied (key lacks required scope)");
+		}
+		if (!res.ok) {
+			return failure(operation, "The control-plane operation could not be completed.");
+		}
+		return { ok: true, operation, pod: parsePodStatus(await readJsonBody(res)) };
+	} catch {
+		return failure(operation, "The control-plane operation could not be completed.");
+	}
+}
+
+/**
  * Run a REST v2 control-plane operation (workers/catalog/billing): auth, then
  * the route. Available on both endpoint families; requires a derivable
- * endpoint id. Non-2xx responses map to a redacted failure (403 names the
- * scope requirement); response bodies are parsed leniently.
+ * endpoint id (pod profiles supply their pod id explicitly). Non-2xx
+ * responses map to a redacted failure (403 names the scope requirement);
+ * response bodies are parsed leniently.
  */
 async function runControlPlaneOperation(
 	profile: ControlProfile,
@@ -322,7 +435,10 @@ async function runControlPlaneOperation(
 	deps: ControlDeps,
 ): Promise<ControlOutcome> {
 	const { operation } = input;
-	const id = deriveEndpointId(profile);
+	// Pod profiles carry their pod id explicitly; endpoint ids are derived
+	// only for serverless endpoints.
+	const id =
+		profile.endpointType === "pod" ? (profile.podId ?? null) : deriveEndpointId(profile);
 	if (id === null) {
 		return failure(operation, "cannot derive endpoint id from invokeUrl");
 	}
@@ -358,10 +474,11 @@ async function runControlPlaneOperation(
 				return { ok: true, operation: "catalog", gpus: parseCatalog(await readJsonBody(res)) };
 			}
 			case "billing": {
-				const res = await fetch(
-					`${base}/v2/billing/serverless?serverlessId=${encodeURIComponent(id)}&bucketSize=hour&lastN=24`,
-					{ method: "GET", headers },
-				);
+				const billingPath =
+					profile.endpointType === "pod"
+						? `${base}/v2/billing/pods?podId=${encodeURIComponent(id)}&bucketSize=hour&lastN=24`
+						: `${base}/v2/billing/serverless?serverlessId=${encodeURIComponent(id)}&bucketSize=hour&lastN=24`;
+				const res = await fetch(billingPath, { method: "GET", headers });
 				if (res.status === 403) {
 					return failure(operation, "control-plane access denied (key lacks required scope)");
 				}
@@ -406,6 +523,18 @@ export async function executeControl(
 		return profile.endpointType === "load-balanced"
 			? runPing(profile, deps)
 			: unsupported(operation, "Ping is only available on load-balanced endpoints.");
+	}
+
+	if (
+		operation === "pod-status" ||
+		operation === "pod-start" ||
+		operation === "pod-stop" ||
+		operation === "pod-restart"
+	) {
+		if (profile.endpointType !== "pod" || profile.podId === undefined) {
+			return unsupported(operation, "This operation is only available on pod profiles.");
+		}
+		return runPodOperation(profile, { ...input, operation }, deps);
 	}
 
 	if (operation === "workers" || operation === "catalog" || operation === "billing") {

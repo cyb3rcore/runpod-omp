@@ -97,6 +97,7 @@ const LB_MODEL = {
 
 const QUEUE = "queue-profile";
 const LB = "lb-profile";
+const POD = "pod-profile";
 
 /** Build a merged queue profile; overrides replace whole fields. */
 function queueProfile(overrides: { mode?: RequestMode } = {}): Profile {
@@ -113,6 +114,24 @@ function queueProfile(overrides: { mode?: RequestMode } = {}): Profile {
 			loadBalancedPath: "/v1/chat/completions",
 		},
 		policy: { maxAttempts: 1, fallbackProfiles: [] },
+	};
+}
+
+/** Build a merged pod profile (control-plane address resolution at call time). */
+function podProfile(): Profile {
+	return {
+		endpointType: "pod",
+		model: LB_MODEL,
+		apiKey: { kind: "secret-reference", ref: "env:RUNPOD_API_KEY", redacted: "[redacted]" },
+		request: {
+			mode: "stream",
+			timeoutMs: 300_000,
+			polling: { intervalMs: 1_000, ttlMs: 1_800_000, focusAware: true },
+			queueAdapter: { kind: "openai-shaped" },
+			loadBalancedPath: "/v1/chat/completions",
+		},
+		policy: { maxAttempts: 1, fallbackProfiles: [] },
+		pod: { id: "pod_abc123", port: 8000 },
 	};
 }
 
@@ -134,8 +153,12 @@ function lbProfile(): Profile {
 	};
 }
 
-/** The two profiles keyed by profile name — the map `createRunpodStream` dispatches over. */
-const PROFILES: Record<string, Profile> = { [QUEUE]: queueProfile(), [LB]: lbProfile() };
+/** The profiles keyed by profile name — the map `createRunpodStream` dispatches over. */
+const PROFILES: Record<string, Profile> = {
+	[QUEUE]: queueProfile(),
+	[LB]: lbProfile(),
+	[POD]: podProfile(),
+};
 
 /** A conversation exercising every normalizeMessage role mapping. */
 const FAKE_CONTEXT = {
@@ -205,7 +228,7 @@ interface RunpodStreamTransportDeps {
 
 /** A recorded dispatch into the injected transport. */
 interface RecordedDispatch {
-	method: "queue" | "loadBalanced";
+	method: "queue" | "loadBalanced" | "pod";
 	profile: Profile;
 	request: NormalizedRequest;
 	deps?: RunpodStreamTransportDeps;
@@ -226,6 +249,7 @@ function makeDeps(
 	overrides: {
 		queue?: () => TransportExecutionResult | Promise<TransportExecutionResult>;
 		loadBalanced?: () => TransportExecutionResult | Promise<TransportExecutionResult>;
+		pod?: () => TransportExecutionResult | Promise<TransportExecutionResult>;
 		resolve?: () => string | undefined | Promise<string | undefined>;
 	} = {},
 ) {
@@ -243,6 +267,19 @@ function makeDeps(
 			return (
 				overrides.loadBalanced?.() ?? {
 					events: [{ type: "text", text: "LB reply" }],
+					details: {
+						requestedMode: "stream",
+						actualMode: "stream",
+						downgrades: [] as DowngradeRecord[],
+					},
+				}
+			);
+		},
+		executePod(profile: Profile, request: NormalizedRequest, d?: RunpodStreamTransportDeps) {
+			dispatches.push({ method: "pod", profile, request, deps: d });
+			return (
+				overrides.pod?.() ?? {
+					events: [{ type: "text", text: "POD reply" }],
 					details: {
 						requestedMode: "stream",
 						actualMode: "stream",
@@ -959,5 +996,70 @@ describe("createRunpodStream failures", () => {
 		const message = (error as Error).message;
 		expect(message).toContain("worker rejected: [redacted]");
 		expect(message).not.toContain(mk.resolvedKey);
+	});
+});
+
+describe("createRunpodStream pod dispatch", () => {
+	test("dispatches a pod profile to executePod with the normalized request and resolved key", async () => {
+		const mk = makeDeps();
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(POD), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const events = await collect(stream);
+
+		const dispatch = mk.dispatches[0]!;
+		expect(dispatch.method).toBe("pod");
+		expect(dispatch.profile.endpointType).toBe("pod");
+		expect(dispatch.request).toEqual(expectedRequest(PROFILES[POD]!.model.id));
+		expect(dispatch.deps?.apiKey).toBe(mk.resolvedKey);
+		expect(dispatch.deps?.signal).toBe(signal);
+		const done = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+		);
+		expect(done?.message.content).toEqual([{ type: "text", text: "POD reply" }]);
+	});
+
+	test("falls back from a transient pod failure to the named fallback profile", async () => {
+		const queueWithFallback: Profile = {
+			...podProfile(),
+			policy: { maxAttempts: 1, fallbackProfiles: [QUEUE] },
+		};
+		const profiles = { ...PROFILES, [POD]: queueWithFallback };
+		const mk = makeDeps({
+			pod: () => {
+				throw markRetryable(new Error("pod worker transient failure"));
+			},
+		});
+		const stream = createRunpodStream(profiles, mk.deps)(modelFor(POD), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const events = await collect(stream);
+
+		expect(mk.dispatches.map((dispatch) => dispatch.method)).toEqual(["pod", "queue"]);
+		const done = events.find(
+			(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+		);
+		expect(done?.message.content).toEqual([
+			{ type: "text", text: "Hello" },
+			{ type: "text", text: " world" },
+		]);
+	});
+
+	test("a deterministic pod failure surfaces immediately without fallback", async () => {
+		const podWithFallback: Profile = {
+			...podProfile(),
+			policy: { maxAttempts: 1, fallbackProfiles: [QUEUE] },
+		};
+		const profiles = { ...PROFILES, [POD]: podWithFallback };
+		const mk = makeDeps({
+			pod: () => {
+				throw new Error("runpod provider: pod pod_abc123 is EXITED — start it with /runpod pod start");
+			},
+		});
+		const stream = createRunpodStream(profiles, mk.deps)(modelFor(POD), FAKE_CONTEXT, FAKE_OPTIONS);
+
+		const error = await resultError(stream);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("pod_abc123 is EXITED");
+		expect(mk.dispatches.map((dispatch) => dispatch.method)).toEqual(["pod"]);
 	});
 });

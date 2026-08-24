@@ -31,6 +31,8 @@ import type {
 	ProfileRequest,
 } from "./profile-schema.js";
 import type { CostReport } from "./cost.js";
+import type { NormalizedPodStatus } from "./control.js";
+import type { PodProbeResult } from "./operations.js";
 
 /** A Runpod profile as surfaced to the command surface. */
 export interface CommandProfile {
@@ -75,6 +77,13 @@ export interface RunpodCommandRuntime {
 	runQueueMutation(profile: string, operation: QueueMutation, jobId?: string): Promise<void>;
 	/** Produce a fresh cost report (live estimate + actual billed) for a profile. */
 	runCost(profileName: string): Promise<CostReport>;
+	/** Run a pod control-plane operation; throws with an actionable message on failure. */
+	runPodOperation(
+		profileName: string,
+		operation: "pod-status" | "pod-start" | "pod-stop" | "pod-restart",
+	): Promise<NormalizedPodStatus>;
+	/** Probe a pod profile's resolved address + readiness; never throws. */
+	podProbe(profileName: string): Promise<PodProbeResult>;
 	notify(message: string, kind?: CommandNoticeKind): void;
 }
 
@@ -86,10 +95,13 @@ export interface ConfigPromptValues {
 	/** Profile name; forced to the explicit argument for `profile add`. */
 	name: string;
 	endpointType: EndpointType;
-	invokeUrl: string;
+	/** Static invokeUrl; required for queue/load-balanced, optional for pods. */
+	invokeUrl?: string;
 	model: ModelMetadata;
 	/** Verbatim apiKey reference (e.g. "env:VAR", "!cmd", or a literal); null = none. */
 	apiKeyRef: string | null;
+	/** Pod block for `endpointType: "pod"` profiles; absent otherwise. */
+	pod?: { id: string; port: number; inferenceApiKeyRef: string | null };
 	request?: Partial<ProfileRequest>;
 	policy?: Partial<ProfilePolicy>;
 }
@@ -217,6 +229,10 @@ async function runCommand(runtime: RunpodCommandRuntime, args: string): Promise<
 			await runCostCommand(runtime, rest);
 			return;
 		}
+		if (command === "pod") {
+			await runPodCommand(runtime, rest);
+			return;
+		}
 		runtime.notify(`Unknown runpod command: ${command}.`, "error");
 	} catch (error) {
 		reportError(runtime, error);
@@ -262,9 +278,11 @@ function reportProfiles(runtime: RunpodCommandRuntime): void {
 		return;
 	}
 	const defaultName = runtime.getDefaultProfile();
-	const lines = profiles.map((profile) =>
-		profile.name === defaultName ? `  ${profile.name} (default)` : `  ${profile.name}`,
-	);
+	const lines = profiles.map((profile) => {
+		const suffix = profile.endpointType === "pod" ? " (pod)" : "";
+		const marker = profile.name === defaultName ? " (default)" : "";
+		return `  ${profile.name}${suffix}${marker}`;
+	});
 	runtime.notify(`Runpod profiles:\n${lines.join("\n")}`, "info");
 }
 
@@ -348,6 +366,116 @@ function formatUsd(amount: number): string {
 	return `$${amount.toFixed(2)}`;
 }
 
+/** Format an uptime in seconds as "Xh Ym"; null (not running) renders as such. */
+function formatUptime(seconds: number | null): string {
+	if (seconds === null) {
+		return "n/a (not running)";
+	}
+	const hours = Math.floor(seconds / 3600);
+	const minutes = Math.floor((seconds % 3600) / 60);
+	return `${hours}h ${minutes}m`;
+}
+
+/**
+ * `/runpod pod …`: pod lifecycle surface, commands only — no auto-start, no
+ * idle auto-stop. `pod` lists each pod profile's live state; `pod <profile>`
+ * shows the full report (state, uptime, rate, data center, resolved address,
+ * readiness); `pod start|stop|restart <profile>` requires interactive
+ * confirmation first (headless sessions fail closed).
+ */
+async function runPodCommand(runtime: RunpodCommandRuntime, args: string[]): Promise<void> {
+	const [subcommand, ...rest] = args;
+	if (subcommand === undefined) {
+		const podProfiles = runtime.listProfiles().filter((profile) => profile.endpointType === "pod");
+		if (podProfiles.length === 0) {
+			runtime.notify("No pod profiles configured.", "info");
+			return;
+		}
+		const lines = ["Runpod pods:"];
+		for (const profile of podProfiles) {
+			try {
+				const status = await runtime.runPodOperation(profile.name, "pod-status");
+				lines.push(`  ${profile.name} · ${status.status} · ${formatUsd(status.costPerHour)}/hr`);
+			} catch (error) {
+				lines.push(
+					`  ${profile.name} · unavailable (${error instanceof Error ? error.message : "unknown error"})`,
+				);
+			}
+		}
+		runtime.notify(lines.join("\n"), "info");
+		return;
+	}
+
+	if (subcommand === "start" || subcommand === "stop" || subcommand === "restart") {
+		const profileName = rest[0];
+		if (profileName === undefined) {
+			runtime.notify(`Missing profile name for pod ${subcommand}.`, "error");
+			return;
+		}
+		await runPodMutation(runtime, subcommand, profileName);
+		return;
+	}
+
+	await showPodReport(runtime, subcommand);
+}
+
+/** Interactive, confirmed pod lifecycle transition; fails closed when headless. */
+async function runPodMutation(
+	runtime: RunpodCommandRuntime,
+	operation: "start" | "stop" | "restart",
+	profileName: string,
+): Promise<void> {
+	const profile = runtime.listProfiles().find((candidate) => candidate.name === profileName);
+	if (profile === undefined) {
+		runtime.notify(`Unknown profile ${profileName}; cannot ${operation} pod.`, "error");
+		return;
+	}
+	if (profile.endpointType !== "pod") {
+		runtime.notify(
+			`Profile ${profileName} is not a pod profile; pod ${operation} requires a pod endpoint.`,
+			"error",
+		);
+		return;
+	}
+	const prompt = `Runpod pod ${operation} on profile ${profileName}?`;
+	if (!(await runtime.confirm(prompt))) {
+		runtime.notify(`Pod ${operation} on profile ${profileName} was not confirmed.`, "error");
+		return;
+	}
+	const status = await runtime.runPodOperation(profileName, `pod-${operation}`);
+	runtime.notify(`Pod ${operation} on profile ${profileName}: now ${status.status}.`, "success");
+}
+
+/** Full pod status report for one profile; read-only, no confirmation. */
+async function showPodReport(runtime: RunpodCommandRuntime, profileName: string): Promise<void> {
+	const profile = runtime.listProfiles().find((candidate) => candidate.name === profileName);
+	if (profile === undefined) {
+		runtime.notify(`Unknown profile ${profileName}; cannot show pod status.`, "error");
+		return;
+	}
+	if (profile.endpointType !== "pod") {
+		runtime.notify(`Profile ${profileName} is not a pod profile.`, "error");
+		return;
+	}
+	const status = await runtime.runPodOperation(profileName, "pod-status");
+	const probe = await runtime.podProbe(profileName);
+	const lines = [`runpod pod · profile "${profileName}"`];
+	lines.push(`  state: ${status.status}`);
+	lines.push(`  cost: ${formatUsd(status.costPerHour)}/hr`);
+	lines.push(`  uptime: ${formatUptime(status.uptimeSeconds)}`);
+	if (status.dataCenterId !== null) {
+		lines.push(`  data center: ${status.dataCenterId}`);
+	}
+	if (probe.address !== undefined) {
+		lines.push(`  address: ${probe.address}`);
+	}
+	lines.push(`  readiness: ${probe.health}`);
+	if (probe.reason !== undefined) {
+		lines.push(`  note: ${probe.reason}`);
+	}
+	runtime.notify(lines.join("\n"), "info");
+}
+
 /**
  * `/runpod cost [profile]`: read-only, always-fresh cost report. Live line is
  * the instantaneous estimate (placed workers × serverless price, plus accrued
@@ -368,7 +496,11 @@ async function runCostCommand(runtime: RunpodCommandRuntime, args: string[]): Pr
 	}
 	const report = await runtime.runCost(profileName);
 	const lines = [`runpod cost · profile "${profileName}"`];
-	if (report.estimate !== undefined) {
+	if (report.pod !== undefined) {
+		lines.push(
+			`Live (pod): ${formatUsd(report.pod.costPerHour)}/hr · ~${formatUsd(report.pod.accruedUsd)} accrued (state ${report.pod.state})`,
+		);
+	} else if (report.estimate !== undefined) {
 		if (report.estimate.totalWorkers === 0) {
 			lines.push(`Live (est): ${formatUsd(0)}/hr burn (no active workers)`);
 		} else {
@@ -416,11 +548,24 @@ function buildProfile(values: ConfigPromptValues): Profile {
 	}
 	const profile: Profile = {
 		endpointType: values.endpointType,
-		invokeUrl: values.invokeUrl,
 		model: values.model,
 		request,
 		policy,
 	};
+	if (values.invokeUrl !== undefined && values.invokeUrl !== "") {
+		profile.invokeUrl = values.invokeUrl;
+	}
+	if (values.pod !== undefined) {
+		const pod: Profile["pod"] = { id: values.pod.id, port: values.pod.port };
+		if (values.pod.inferenceApiKeyRef !== null) {
+			pod.inferenceApiKey = {
+				kind: "secret-reference",
+				ref: values.pod.inferenceApiKeyRef,
+				redacted: REDACTED,
+			};
+		}
+		profile.pod = pod;
+	}
 	if (values.apiKeyRef !== null) {
 		profile.apiKey = {
 			kind: "secret-reference",

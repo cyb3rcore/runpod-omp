@@ -170,3 +170,105 @@ describe("registerRunpodTools", () => {
 		expect(result.details.freshness).toBe("live");
 	});
 });
+
+describe("runpod_pod tool", () => {
+	const POD_NAME = "subs";
+	const POD_PROFILE = makeProfile({
+		endpointType: "pod",
+		invokeUrl: undefined,
+		pod: { id: "pod_abc123", port: 8000 },
+	});
+
+	function podStatusOutcome(): ControlOutcome {
+		return {
+			ok: true,
+			operation: "pod-status",
+			pod: {
+				id: "pod_abc123",
+				name: "qwen-subs",
+				status: "RUNNING",
+				costPerHour: 1.19,
+				uptimeSeconds: 7_200,
+				dataCenterId: "US-TX-1",
+			},
+		};
+	}
+
+	test("registers runpod_pod only when a pod profile exists and a probe is wired", () => {
+		const log: RecordedTool[] = [];
+		registerRunpodTools(createMockPi(log), { [POD_NAME]: POD_PROFILE }, recordingControl(() => okOutcome("ping")).control, async () => ({
+			address: "http://45.23.12.1:43210",
+			health: "healthy",
+		}));
+		expect(registeredNames(log)).toContain("runpod_pod");
+
+		const noPodLog: RecordedTool[] = [];
+		registerRunpodTools(
+			createMockPi(noPodLog),
+			{ queue: makeProfile() },
+			recordingControl(() => okOutcome("ping")).control,
+			async () => ({ address: "http://x", health: "healthy" }),
+		);
+		expect(registeredNames(noPodLog)).not.toContain("runpod_pod");
+	});
+
+	test("reports state, rate, uptime, address, and readiness without key material", async () => {
+		const { calls, control } = recordingControl(() => podStatusOutcome());
+		const log: RecordedTool[] = [];
+		registerRunpodTools(createMockPi(log), { [POD_NAME]: POD_PROFILE }, control, async () => ({
+			address: "http://45.23.12.1:43210",
+			health: "healthy",
+		}));
+		const result = await runTool(registered(log, "runpod_pod"), { profile: POD_NAME });
+
+		expect(calls).toEqual([{ profile: POD_NAME, input: { operation: "pod-status" } }]);
+		expect(result.isError).not.toBe(true);
+		const text = result.content[0]!.text;
+		expect(text).toContain("RUNNING");
+		expect(text).toContain("$1.19/hr");
+		expect(text).toContain("2h 0m");
+		expect(text).toContain("US-TX-1");
+		expect(text).toContain("http://45.23.12.1:43210");
+		expect(text).toContain("healthy");
+		expect(text).not.toContain(SECRET_MARKER);
+	});
+
+	test("a stopped pod reports the state with the reason and no address", async () => {
+		const { control } = recordingControl(() => ({
+			ok: true,
+			operation: "pod-status",
+			pod: {
+				id: "pod_abc123",
+				name: "qwen-subs",
+				status: "EXITED",
+				costPerHour: 0,
+				uptimeSeconds: null,
+				dataCenterId: "US-TX-1",
+			},
+		}));
+		const log: RecordedTool[] = [];
+		registerRunpodTools(createMockPi(log), { [POD_NAME]: POD_PROFILE }, control, async () => ({
+			health: "unhealthy",
+			reason: "runpod provider: pod pod_abc123 is EXITED — start it with /runpod pod start",
+		}));
+		const result = await runTool(registered(log, "runpod_pod"), { profile: POD_NAME });
+
+		const text = result.content[0]!.text;
+		expect(text).toContain("EXITED");
+		expect(text).toContain("$0.00/hr");
+		expect(text).toContain("readiness: unhealthy");
+		expect(text).toContain("/runpod pod start");
+		expect(text).not.toContain("address:");
+	});
+
+	test("an unknown profile fails with an explicit reason", async () => {
+		const log: RecordedTool[] = [];
+		registerRunpodTools(createMockPi(log), { [POD_NAME]: POD_PROFILE }, recordingControl(() => podStatusOutcome()).control, async () => ({
+			health: "unhealthy",
+		}));
+		const result = await runTool(registered(log, "runpod_pod"), { profile: "ghost" });
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]!.text).toContain("No profile matched the supplied profile name.");
+	});
+});

@@ -37,6 +37,7 @@ import {
 import { resolveProfileApiKey } from "./config.js";
 import type { Profile } from "./profile-schema.js";
 import { executeLoadBalancedTransport } from "./transport/load-balanced.js";
+import { executePodTransport } from "./transport/pod.js";
 import { executeQueueTransport } from "./transport/queue.js";
 import { isRetryableError } from "./transport/types.js";
 import { createJournal, resolveJournalPath, type Journal } from "./journal.js";
@@ -346,6 +347,11 @@ function hoistSystemMessages(messages: NormalizedMessage[]): NormalizedMessage[]
  */
 export interface RunpodStreamDeps {
 	executeQueue(
+		profile: Profile,
+		request: NormalizedRequest,
+		deps?: RunpodStreamTransportDeps,
+	): TransportExecutionResult | Promise<TransportExecutionResult>;
+	executePod(
 		profile: Profile,
 		request: NormalizedRequest,
 		deps?: RunpodStreamTransportDeps,
@@ -695,10 +701,14 @@ export function createRunpodStream(
 								candidate: candidate.model.id,
 								request: requestSummary(request),
 							});
-							const result =
-								candidate.endpointType === "queue"
-									? await deps.executeQueue(candidate, request, candidateDeps)
-									: await deps.executeLoadBalanced(candidate, request, candidateDeps);
+							let result: TransportExecutionResult;
+							if (candidate.endpointType === "queue") {
+								result = await deps.executeQueue(candidate, request, candidateDeps);
+							} else if (candidate.endpointType === "pod") {
+								result = await deps.executePod(candidate, request, candidateDeps);
+							} else {
+								result = await deps.executeLoadBalanced(candidate, request, candidateDeps);
+							}
 							journal?.record({
 								kind: "dispatch-done",
 								ts: new Date().toISOString(),
@@ -770,6 +780,7 @@ function createDefaultStreamDeps(): RunpodStreamDeps {
 		executeQueue: (profile, request, deps) => executeQueueTransport(profile, request, deps),
 		executeLoadBalanced: (profile, request, deps) =>
 			executeLoadBalancedTransport(profile, request, deps),
+		executePod: (profile, request, deps) => executePodTransport(profile, request, deps),
 		resolveApiKey: async (options, profile) => {
 			const ompApiKey = await resolveApiKeyOnce(options?.apiKey, options?.signal);
 			return resolveProfileApiKey(profile, {

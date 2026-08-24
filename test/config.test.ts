@@ -337,3 +337,124 @@ describe("writeProfileDocument", () => {
 		}
 	});
 });
+
+describe("parseProfileDocument: pod profiles", () => {
+	test("parses a pod profile with podId, default port 8000, no invokeUrl, and optional inferenceApiKey", () => {
+		const result = parseProfileDocument(
+			toYaml({
+				version: 1,
+				profiles: {
+					subs: {
+						endpointType: "pod",
+						pod: { id: "pod_abc123" },
+						model: MODEL,
+						request: { mode: "sync" },
+					},
+				},
+			}),
+			"pod.yml",
+		);
+		expect(result.errors).toEqual([]);
+		const profile = result.document!.profiles["subs"]!;
+		expect(profile.endpointType).toBe("pod");
+		expect(profile.invokeUrl).toBeUndefined();
+		expect(profile.pod).toEqual({
+			id: "pod_abc123",
+			port: 8000,
+			inferenceApiKey: undefined,
+		});
+	});
+
+	test("accepts an explicit port, inferenceApiKey reference, and static invokeUrl override", () => {
+		const result = parseProfileDocument(
+			toYaml({
+				version: 1,
+				profiles: {
+					subs: {
+						endpointType: "pod",
+						invokeUrl: "https://pod-abc123-8000.proxy.runpod.net",
+						pod: {
+							id: "pod_abc123",
+							port: 8080,
+							inferenceApiKey: { ref: "env:POD_INFERENCE_KEY" },
+						},
+						model: MODEL,
+						request: { mode: "stream" },
+					},
+				},
+			}),
+			"pod.yml",
+		);
+		expect(result.errors).toEqual([]);
+		const profile = result.document!.profiles["subs"]!;
+		expect(profile.invokeUrl).toBe("https://pod-abc123-8000.proxy.runpod.net");
+		expect(profile.pod).toEqual({
+			id: "pod_abc123",
+			port: 8080,
+			inferenceApiKey: {
+				kind: "secret-reference",
+				ref: "env:POD_INFERENCE_KEY",
+				redacted: "[redacted]",
+			},
+		});
+	});
+
+	test("rejects a pod profile missing pod.id and keeps other profiles intact", () => {
+		const result = parseProfileDocument(
+			toYaml({
+				version: 1,
+				profiles: {
+					broken: {
+						endpointType: "pod",
+						pod: { port: 8000 },
+						model: MODEL,
+						request: { mode: "sync" },
+					},
+					good: profileFixture(),
+				},
+			}),
+			"pod.yml",
+		);
+		expect(Object.keys(result.document!.profiles)).toEqual(["good"]);
+		expect(result.errors.some((error) => error.message.includes("pod.id"))).toBe(true);
+	});
+
+	test("rejects a pod profile with a non-integer port", () => {
+		const result = parseProfileDocument(
+			toYaml({
+				version: 1,
+				profiles: {
+					broken: {
+						endpointType: "pod",
+						pod: { id: "pod_abc123", port: -1 },
+						model: MODEL,
+						request: { mode: "sync" },
+					},
+				},
+			}),
+			"pod.yml",
+		);
+		expect(Object.keys(result.document!.profiles)).toEqual([]);
+		expect(result.errors.some((error) => error.message.includes("pod.port"))).toBe(true);
+	});
+
+	test("queue/load-balanced profiles still require invokeUrl; pod does not", () => {
+		const result = parseProfileDocument(
+			toYaml({
+				version: 1,
+				profiles: {
+					"no-url": { endpointType: "queue", model: MODEL, request: { mode: "sync" } },
+					subs: {
+						endpointType: "pod",
+						pod: { id: "pod_abc123" },
+						model: MODEL,
+						request: { mode: "sync" },
+					},
+				},
+			}),
+			"pod.yml",
+		);
+		expect(Object.keys(result.document!.profiles)).toEqual(["subs"]);
+		expect(result.errors.some((error) => error.message.includes("invokeUrl"))).toBe(true);
+	});
+});

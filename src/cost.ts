@@ -12,7 +12,12 @@
  * estimate covers that gap).
  */
 import { TimedHealthCache } from "./health.js";
-import type { ControlOutcome, ControlWorker } from "./control.js";
+import type {
+	ControlOutcome,
+	ControlWorker,
+	NormalizedPodStatus,
+	PodLifecycleStatus,
+} from "./control.js";
 import type { RunpodControl } from "./operations.js";
 import type { EndpointType } from "./profile-schema.js";
 
@@ -50,6 +55,8 @@ export interface CostReport {
 	estimateError?: string;
 	billed?: BilledSummary;
 	billedError?: string;
+	/** Pod profiles only: live state and rate from the pod API. */
+	pod?: { state: PodLifecycleStatus; costPerHour: number; accruedUsd: number };
 }
 
 /** The injected, testable clock/cache options for the service. */
@@ -98,6 +105,13 @@ function isBillingOutcome(
 	return outcome.ok && outcome.operation === "billing";
 }
 
+/** Narrow a successful outcome to the pod-status variant. */
+function isPodStatusOutcome(
+	outcome: ControlOutcome,
+): outcome is Extract<ControlOutcome, { ok: true; operation: "pod-status" }> {
+	return outcome.ok && outcome.operation === "pod-status";
+}
+
 /**
  * Create the cost service over an injected control dispatcher.
  *
@@ -130,6 +144,19 @@ export function createCostService(
 			return { error: "unexpected control outcome" };
 		}
 		return outcome.workers;
+	}
+
+	async function fetchPodStatus(
+		profileName: string,
+	): Promise<NormalizedPodStatus | { error: string }> {
+		const outcome = await control(profileName, { operation: "pod-status" });
+		if (!outcome.ok) {
+			return { error: failureReason(outcome) };
+		}
+		if (!isPodStatusOutcome(outcome)) {
+			return { error: "unexpected control outcome" };
+		}
+		return outcome.pod;
 	}
 
 	async function estimate(
@@ -254,6 +281,37 @@ export function createCostService(
 		endpointType: EndpointType,
 		opts?: { fresh?: boolean },
 	): Promise<CostReport> {
+		if (endpointType === "pod") {
+			// Pods have no workers or catalog price: the live section comes
+			// from the pod API itself (Pod.cost is USD/hour, 0 when stopped),
+			// with accrued = rate × uptime. `estimate` stays queue/LB-shaped.
+			const [podResult, billedResult] = await Promise.all([
+				fetchPodStatus(profileName),
+				billed(profileName),
+			]);
+			const report: CostReport = { profile: profileName, endpointType };
+			if ("error" in podResult) {
+				report.estimateError = podResult.error;
+			} else {
+				const ratePerHour = podResult.costPerHour;
+				const accruedUsd =
+					podResult.uptimeSeconds !== null
+						? (podResult.uptimeSeconds * ratePerHour) / 3600
+						: 0;
+				report.pod = {
+					state: podResult.status,
+					costPerHour: ratePerHour,
+					accruedUsd,
+				};
+			}
+			if ("error" in billedResult) {
+				report.billedError = billedResult.error;
+			} else {
+				report.billed = billedResult;
+			}
+			return report;
+		}
+
 		const [estimateResult, billedResult] = await Promise.all([
 			estimate(profileName, opts),
 			billed(profileName),

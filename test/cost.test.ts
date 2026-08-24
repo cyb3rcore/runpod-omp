@@ -41,12 +41,17 @@ function billingOutcome(records: Array<{ totalAmount: number; gpuAmount?: number
 
 /** Canned control dispatcher; records every call. */
 function fakeControl(
-	responses: { workers?: ControlOutcome; catalog?: ControlOutcome; billing?: ControlOutcome },
+	responses: {
+		workers?: ControlOutcome;
+		catalog?: ControlOutcome;
+		billing?: ControlOutcome;
+		"pod-status"?: ControlOutcome;
+	},
 ): { calls: Array<{ profileName: string; input: ControlInput }>; control: RunpodControl } {
 	const calls: Array<{ profileName: string; input: ControlInput }> = [];
 	const control: RunpodControl = async (profileName, input) => {
 		calls.push({ profileName, input });
-		const outcome = responses[input.operation as "workers" | "catalog" | "billing"];
+		const outcome = responses[input.operation as "workers" | "catalog" | "billing" | "pod-status"];
 		if (outcome === undefined) {
 			return { ok: false, operation: input.operation, supported: false, reason: "no fixture" };
 		}
@@ -337,5 +342,84 @@ describe("createCostService().report", () => {
 		expect(report.billedError).toBe("cannot derive endpoint id from invokeUrl");
 		expect(report.estimate).toMatchObject({ ratePerHour: 1.1 });
 		expect(report.estimateError).toBeUndefined();
+	});
+});
+
+describe("createCostService().report (pod profiles)", () => {
+	const PROFILE = "subs";
+
+	function podStatusOutcome(status: "RUNNING" | "EXITED", costPerHour: number, uptimeSeconds: number | null): ControlOutcome {
+		return {
+			ok: true,
+			operation: "pod-status",
+			pod: {
+				id: "pod_abc123",
+				name: "qwen-subs",
+				status,
+				costPerHour,
+				uptimeSeconds,
+				dataCenterId: "US-TX-1",
+			},
+		};
+	}
+
+	test("live section comes from Pod.cost and uptime; estimate stays absent", async () => {
+		const { calls, control } = fakeControl({
+			"pod-status": podStatusOutcome("RUNNING", 1.19, 7_200),
+			billing: billingOutcome([{ totalAmount: 8.9, gpuAmount: 7.5, diskAmount: 0.4, feeAmount: 1.0 }]),
+		});
+		const service = createCostService(control);
+
+		const report = await service.report(PROFILE, "pod");
+
+		expect(calls.map((call) => call.input.operation)).toEqual(["pod-status", "billing"]);
+		expect(report.estimate).toBeUndefined();
+		// 7200 s × $1.19/hr / 3600 = $2.38 accrued
+		expect(report.pod).toEqual({
+			state: "RUNNING",
+			costPerHour: 1.19,
+			accruedUsd: 2.38,
+		});
+		expect(report.billed?.totalUsd).toBe(8.9);
+	});
+
+	test("a stopped pod reports $0/hr and zero accrued", async () => {
+		const { control } = fakeControl({
+			"pod-status": podStatusOutcome("EXITED", 0, null),
+			billing: billingOutcome([]),
+		});
+		const service = createCostService(control);
+
+		const report = await service.report(PROFILE, "pod");
+
+		expect(report.pod).toEqual({ state: "EXITED", costPerHour: 0, accruedUsd: 0 });
+		expect(report.estimate).toBeUndefined();
+	});
+
+	test("a failed pod-status degrades the live line only", async () => {
+		const { control } = fakeControl({
+			billing: billingOutcome([{ totalAmount: 1.0 }]),
+		});
+		const service = createCostService(control);
+
+		const report = await service.report(PROFILE, "pod");
+
+		expect(report.pod).toBeUndefined();
+		expect(report.estimateError).toBe("no fixture");
+		expect(report.billed?.totalUsd).toBe(1.0);
+	});
+
+	test("queue/LB reports are unchanged: estimate present, pod absent", async () => {
+		const { control } = fakeControl({
+			workers: workersOutcome([RTX4090_WORKER]),
+			catalog: catalogOutcome({ "NVIDIA GeForce RTX 4090": 1.1 }),
+			billing: billingOutcome([{ totalAmount: 8.9 }]),
+		});
+		const service = createCostService(control);
+
+		const report = await service.report(PROFILE, "queue");
+
+		expect(report.estimate).toBeDefined();
+		expect(report.pod).toBeUndefined();
 	});
 });

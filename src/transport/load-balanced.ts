@@ -22,15 +22,16 @@
 import { decodeOpenAiShaped } from "../adapters/openai-shaped.js";
 import { isRecord, type Profile } from "../profile-schema.js";
 import { UnsupportedOutputShapeError, defaultTransportDeps, markRetryable } from "./types.js";
-import type {
-	NormalizedRequest,
-	NormalizedResponse,
-	NormalizedStreamEvent,
-	NormalizedToolCall,
-	NormalizedUsage,
-	RequestMode,
-	TransportDeps,
-	TransportExecutionResult,
+import {
+	resolveSecretRef,
+	type NormalizedRequest,
+	type NormalizedResponse,
+	type NormalizedStreamEvent,
+	type NormalizedToolCall,
+	type NormalizedUsage,
+	type RequestMode,
+	type TransportDeps,
+	type TransportExecutionResult,
 } from "./types.js";
 
 /** Health states mapped from the load-balanced `/ping` probe. */
@@ -73,31 +74,13 @@ function resolveBearerToken(profile: Profile, deps: TransportDeps): string | und
 	}
 	const reference = profile.apiKey;
 	if (reference !== undefined) {
-		const ref = reference.ref;
-		if (ref.startsWith("env:")) {
-			const name = ref.slice("env:".length);
-			const value = name.length > 0 ? process.env[name] : undefined;
-			if (value !== undefined && value.length > 0) {
-				return value;
-			}
-		} else if (ref.startsWith("!")) {
-			throw new Error(
-				"Runpod secret reference cannot be resolved by the transport; " +
-					"command references are resolved by the plugin and passed via deps.apiKey",
-			);
-		} else {
-			// A bare environment-variable name, or a literal key when no
-			// such variable is set.
-			const value = ref.length > 0 ? process.env[ref] : undefined;
-			if (value !== undefined && value.length > 0) {
-				return value;
-			}
-			if (ref.length > 0) {
-				return ref;
-			}
+		const resolved = resolveSecretRef(reference.ref, process.env);
+		if (resolved !== undefined) {
+			return resolved;
 		}
 	}
-	const defaultKey = process.env.RUNPOD_API_KEY;
+	const defaultKey =
+		deps.noEnvKeyFallback === true ? undefined : process.env.RUNPOD_API_KEY;
 	if (defaultKey !== undefined && defaultKey.length > 0) {
 		return defaultKey;
 	}
@@ -410,9 +393,9 @@ export async function executeLoadBalancedTransport(
 	request: NormalizedRequest,
 	deps: TransportDeps = {},
 ): Promise<TransportExecutionResult> {
-	if (profile.endpointType !== "load-balanced") {
+	if (profile.invokeUrl === undefined) {
 		throw new Error(
-			`Load-balanced transport requires a load-balanced profile; profile endpointType is ${JSON.stringify(profile.endpointType)}`,
+			`Load-balanced transport requires a profile invokeUrl; profile endpointType is ${JSON.stringify(profile.endpointType)}`,
 		);
 	}
 
@@ -465,9 +448,9 @@ export async function probeLoadBalancedHealth(
 	profile: Profile,
 	deps: TransportDeps = {},
 ): Promise<LoadBalancedHealth> {
-	if (profile.endpointType !== "load-balanced") {
+	if (profile.invokeUrl === undefined) {
 		throw new Error(
-			`Load-balanced health probe requires a load-balanced profile; profile endpointType is ${JSON.stringify(profile.endpointType)}`,
+			`Load-balanced health probe requires a profile invokeUrl; profile endpointType is ${JSON.stringify(profile.endpointType)}`,
 		);
 	}
 

@@ -530,3 +530,117 @@ describe("registerRunpodCommands: unknown subcommand", () => {
 		expect(setModel).not.toHaveBeenCalled();
 	});
 });
+
+describe("registerRunpodCommands: /runpod pod", () => {
+	const POD_PROFILE: CommandProfile = { name: "subs", endpointType: "pod" };
+
+	const POD_STATUS = {
+		id: "pod_abc123",
+		name: "qwen-subs",
+		status: "RUNNING",
+		costPerHour: 1.19,
+		uptimeSeconds: 7_200,
+		dataCenterId: "US-TX-1",
+	};
+
+	test("pod <profile> renders the full report including readiness and address", async () => {
+		const podStatusCalls: Array<{ profile: string; operation: string }> = [];
+		const { runtime, log } = createRuntime({
+			listProfiles: () => [POD_PROFILE],
+			async runPodOperation(profileName, operation) {
+				podStatusCalls.push({ profile: profileName, operation });
+				return POD_STATUS;
+			},
+			async podProbe(profileName) {
+				return { address: "http://45.23.12.1:43210", health: "healthy" };
+			},
+		});
+		const { handler } = register(runtime);
+
+		await handler("pod subs", {});
+
+		expect(podStatusCalls).toEqual([{ profile: "subs", operation: "pod-status" }]);
+		expect(log.notices[0]!.message).toContain('profile "subs"');
+		expect(log.notices[0]!.message).toContain("state: RUNNING");
+		expect(log.notices[0]!.message).toContain("$1.19/hr");
+		expect(log.notices[0]!.message).toContain("2h 0m");
+		expect(log.notices[0]!.message).toContain("US-TX-1");
+		expect(log.notices[0]!.message).toContain("http://45.23.12.1:43210");
+		expect(log.notices[0]!.message).toContain("readiness: healthy");
+	});
+
+	test("pod <profile> on a non-pod profile errors explicitly", async () => {
+		const { runtime, log } = createRuntime({
+			listProfiles: () => [QUEUE_PROFILE],
+		});
+		const { handler } = register(runtime);
+
+		await handler("pod prod", {});
+
+		expect(log.notices[0]!.message).toContain("not a pod profile");
+	});
+
+	test("pod stop requires confirmation and fails closed when headless", async () => {
+		const mutations: string[] = [];
+		const { runtime, log } = createRuntime(
+			{
+				listProfiles: () => [POD_PROFILE],
+				async runPodOperation(profileName, operation) {
+					mutations.push(`${operation}:${profileName}`);
+					return { ...POD_STATUS, status: "EXITED", costPerHour: 0, uptimeSeconds: null };
+				},
+			},
+			false,
+		);
+		const { handler } = register(runtime);
+
+		await handler("pod stop subs", {});
+
+		expect(mutations).toEqual([]);
+		expect(log.notices[0]!.message).toContain("was not confirmed");
+	});
+
+	test("pod stop confirms interactively and reports the resulting state", async () => {
+		const mutations: string[] = [];
+		const { runtime, log } = createRuntime({
+			listProfiles: () => [POD_PROFILE],
+			async runPodOperation(profileName, operation) {
+				mutations.push(`${operation}:${profileName}`);
+				return { ...POD_STATUS, status: "EXITED", costPerHour: 0, uptimeSeconds: null };
+			},
+		});
+		const { handler } = register(runtime);
+
+		await handler("pod stop subs", {});
+
+		expect(mutations).toEqual(["pod-stop:subs"]);
+		expect(log.notices[0]!.message).toContain("now EXITED");
+	});
+
+	test("pod (no args) lists pod profiles with live states", async () => {
+		const { runtime, log } = createRuntime({
+			listProfiles: () => [QUEUE_PROFILE, POD_PROFILE],
+			async runPodOperation(profileName, operation) {
+				return operation === "pod-status" && profileName === "subs"
+					? POD_STATUS
+					: POD_STATUS;
+			},
+		});
+		const { handler } = register(runtime);
+
+		await handler("pod", {});
+
+		const message = log.notices[0]!.message;
+		expect(message).toContain("subs · RUNNING · $1.19/hr");
+		expect(message).not.toContain("prod");
+	});
+
+	test("pod with no pod profiles reports none", async () => {
+		const { runtime, log } = createRuntime({ listProfiles: () => [QUEUE_PROFILE] });
+		const { handler } = register(runtime);
+
+		await handler("pod", {});
+
+		expect(log.notices[0]!.message).toBe("No pod profiles configured.");
+	});
+});

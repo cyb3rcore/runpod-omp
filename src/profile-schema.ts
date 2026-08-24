@@ -21,8 +21,8 @@ import { parse as parseYaml } from "yaml";
 
 import type { RequestMode } from "./transport/types.js";
 
-/** How a Runpod endpoint routes requests: managed queue or direct HTTP. */
-export type EndpointType = "queue" | "load-balanced";
+/** How a Runpod endpoint routes requests: managed queue, direct HTTP, or a pod. */
+export type EndpointType = "queue" | "load-balanced" | "pod";
 
 /**
  * Transport adapter kinds the provider can speak to a worker with. The
@@ -74,20 +74,37 @@ export interface ProfileRequest {
 	loadBalancedPath: string;
 }
 
+/** Pod-targeted config for `endpointType: pod` profiles. */
+export interface PodConfig {
+	/** Runpod pod id (e.g. "pod_abc123") — control-plane + TCP resolution. */
+	id: string;
+	/** Internal port llama.cpp listens on; defaults to 8000. */
+	port: number;
+	/** Optional Bearer token for llama.cpp --api-key; absent = keyless. */
+	inferenceApiKey?: SecretReference;
+}
+
 /** Retry/fallback policy for an inference profile. */
 export interface ProfilePolicy {
 	maxAttempts: number;
 	fallbackProfiles: string[];
 }
 
-/** A validated profile: required fields plus applied planned defaults. */
+/**
+ * A validated profile: required fields plus applied planned defaults.
+ * `invokeUrl` is required for queue/load-balanced profiles and optional for
+ * pod profiles (absent = TCP auto-derivation at runtime; present = static
+ * override such as a proxy URL or tunnel).
+ */
 export interface Profile {
 	endpointType: EndpointType;
-	invokeUrl: string;
+	invokeUrl?: string;
 	model: ModelMetadata;
 	apiKey?: SecretReference;
 	request: ProfileRequest;
 	policy: ProfilePolicy;
+	/** Present only when `endpointType === "pod"`. */
+	pod?: PodConfig;
 }
 
 /** A parsed version-1 profile document. */
@@ -109,7 +126,7 @@ export interface ProfileDocumentResult {
 	errors: ProfileValidationError[];
 }
 
-const ENDPOINT_TYPES: readonly EndpointType[] = ["queue", "load-balanced"];
+const ENDPOINT_TYPES: readonly EndpointType[] = ["queue", "load-balanced", "pod"];
 const REQUEST_MODES: readonly RequestMode[] = ["sync", "async", "stream"];
 const ADAPTER_KINDS: readonly AdapterKind[] = ["openai-shaped", "messages-text", "module"];
 const MODEL_INPUT_MODES: readonly string[] = ["text", "image"];
@@ -122,6 +139,7 @@ const DEFAULT_QUEUE_ADAPTER_KIND: AdapterKind = "openai-shaped";
 const DEFAULT_QUEUE_ADAPTER_EXPORT = "adapter";
 const DEFAULT_LOAD_BALANCED_PATH = "/v1/chat/completions";
 const DEFAULT_MAX_ATTEMPTS = 1;
+const DEFAULT_POD_PORT = 8000;
 const REDACTED = "[redacted]";
 
 /**
@@ -220,14 +238,25 @@ function parseProfile(
 		sourcePath,
 		errors,
 	);
-	const invokeUrl = parseInvokeUrl(
-		value.invokeUrl,
-		`profile "${name}" field "invokeUrl"`,
-		sourcePath,
-		errors,
-	);
+	// Non-pod profiles carry no pod block; only a failed parse yields null.
+	const pod = endpointType === "pod" ? parsePod(value.pod, name, sourcePath, errors) : undefined;
+	// queue/load-balanced profiles require invokeUrl; pod profiles accept it
+	// as an optional static override — absent (undefined) means TCP
+	// auto-derivation at runtime from the pod's public port mapping, while a
+	// null parse result means the field was present but invalid.
+	let invokeUrl: string | null | undefined;
+	if (endpointType === "pod" && value.invokeUrl === undefined) {
+		invokeUrl = undefined;
+	} else {
+		invokeUrl = parseInvokeUrl(
+			value.invokeUrl,
+			`profile "${name}" field "invokeUrl"`,
+			sourcePath,
+			errors,
+		);
+	}
 	const model = parseModel(value.model, name, sourcePath, errors);
-	if (endpointType === null || invokeUrl === null || model === null) {
+	if (endpointType === null || pod === null || invokeUrl === null || model === null) {
 		return null;
 	}
 
@@ -250,7 +279,15 @@ function parseProfile(
 		return null;
 	}
 
-	return { endpointType, invokeUrl, model, apiKey, request, policy };
+	return {
+		endpointType,
+		invokeUrl: invokeUrl ?? undefined,
+		model,
+		apiKey,
+		request,
+		policy,
+		pod: pod ?? undefined,
+	};
 }
 
 /** Validate an enum-typed field against an allowed list. */
@@ -496,6 +533,58 @@ function parseModelInput(
 }
 
 /**
+ * Validate a pod block for `endpointType: pod` profiles: a required non-empty
+ * pod id, a positive-integer internal port defaulting to 8000, and an
+ * optional inference API key reference (parsed like `apiKey`, never resolved
+ * here).
+ */
+function parsePod(
+	input: unknown,
+	name: string,
+	sourcePath: string,
+	errors: ProfileValidationError[],
+): PodConfig | null {
+	if (!isRecord(input)) {
+		errors.push({ sourcePath, message: `profile "${name}" field "pod" must be an object` });
+		return null;
+	}
+
+	const id = parseRequiredString(
+		input.id,
+		`profile "${name}" field "pod.id"`,
+		sourcePath,
+		errors,
+	);
+	const port = parsePositiveInteger(
+		input.port,
+		`profile "${name}" field "pod.port"`,
+		sourcePath,
+		errors,
+		DEFAULT_POD_PORT,
+	);
+	let inferenceApiKey: SecretReference | undefined;
+	if (input.inferenceApiKey !== undefined) {
+		const parsedApiKey = parseApiKey(
+			input.inferenceApiKey,
+			name,
+			sourcePath,
+			errors,
+			"pod.inferenceApiKey",
+		);
+		if (parsedApiKey === null) {
+			return null;
+		}
+		inferenceApiKey = parsedApiKey;
+	}
+
+	if (id === null || port === null) {
+		return null;
+	}
+
+	return { id, port, inferenceApiKey };
+}
+
+/**
  * Validate an API key. Keys are never resolved here: the accepted forms are a
 …
  * like OMP custom providers), a `!command` reference string, or a reference
@@ -509,12 +598,13 @@ function parseApiKey(
 	name: string,
 	sourcePath: string,
 	errors: ProfileValidationError[],
+	field = "apiKey",
 ): SecretReference | null {
 	if (typeof input === "string") {
 		if (input.length === 0) {
 			errors.push({
 				sourcePath,
-				message: `profile "${name}" field "apiKey" must be a non-empty string or a secret reference object like { ref: "env:VAR" }`,
+				message: `profile "${name}" field "${field}" must be a non-empty string or a secret reference object like { ref: "env:VAR" }`,
 			});
 			return null;
 		}
@@ -525,7 +615,7 @@ function parseApiKey(
 	}
 	errors.push({
 		sourcePath,
-		message: `profile "${name}" field "apiKey" must be an environment-variable name, a literal, a "!command" reference, or a secret reference object like { ref: "env:VAR" }`,
+		message: `profile "${name}" field "${field}" must be an environment-variable name, a literal, a "!command" reference, or a secret reference object like { ref: "env:VAR" }`,
 	});
 	return null;
 }

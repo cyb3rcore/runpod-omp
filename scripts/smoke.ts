@@ -86,6 +86,8 @@ let OMP_BIN: string;
 
 const QUEUE_MARKER = "QUEUE_SMOKE_OK";
 const LB_MARKER = "LB_SMOKE_OK";
+const POD_MARKER = "POD_SMOKE_OK";
+const POD_TOOL_MARKER = "POD_TOOL_SMOKE_OK";
 const OMP_ARGS_TIMEOUT_MS = 180_000;
 
 function assert(condition: unknown, message: string, capture = ""): asserts condition {
@@ -239,6 +241,8 @@ async function main(): Promise<void> {
 	// 2. Fake servers.
 	const queueHits: string[] = [];
 	const lbHits: string[] = [];
+	const podApiHits: string[] = [];
+	let sawPodTools = false;
 
 	const completion = (marker: string) => ({
 		id: `chatcmpl-${marker}`,
@@ -283,9 +287,111 @@ async function main(): Promise<void> {
 			if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
 				return Response.json(completion(LB_MARKER));
 			}
+			if (request.method === "GET" && url.pathname === "/health") {
+				return new Response("ok", { status: 200 });
+			}
 			return Response.json(
 				{ error: { message: `lb server: unexpected request ${request.method} ${url.pathname}` } },
 				{ status: 400 },
+			);
+		},
+	});
+	// The fake worker behind the pod profile: answers completions (plain, or
+	// tool-calling exactly once for the dedicated tool scenario) and the
+	// llama /health. OMP's CLI attaches its tool registry to every request,
+	// so the tool completion is gated on the scenario prompt and served only
+	// once — otherwise the agentic tool loop would re-dispatch forever.
+	let podToolCallServed = false;
+	const podLlamaServer = Bun.serve({
+		port: 0,
+		async fetch(request) {
+			const url = new URL(request.url);
+			lbHits.push(`${request.method} ${url.pathname}`);
+			if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
+				const body: unknown = await request.json().catch(() => undefined);
+				const record = isRecord(body) ? body : {};
+				const hasTools = Array.isArray(record.tools) && record.tools.length > 0;
+				const messages = Array.isArray(record.messages) ? record.messages : [];
+				const lastUser = [...messages].reverse().find(
+					(message): message is { role: "user"; content: unknown } =>
+						isRecord(message) && message.role === "user",
+				);
+				const wantsToolCall =
+					typeof lastUser?.content === "string" && lastUser.content.includes("use a tool");
+				if (hasTools && wantsToolCall && !podToolCallServed) {
+					podToolCallServed = true;
+					sawPodTools = true;
+					return Response.json({
+						id: "chatcmpl-tool",
+						object: "chat.completion",
+						created: Math.floor(Date.now() / 1000),
+						model: "smoke-fake",
+						choices: [
+							{
+								index: 0,
+								message: {
+									role: "assistant",
+									content: null,
+									tool_calls: [
+										{
+											id: "call_pod",
+											type: "function",
+											function: { name: "smoke_pod_tool", arguments: "{}" },
+										},
+									],
+								},
+								finish_reason: "tool_calls",
+							},
+						],
+						usage: { prompt_tokens: 4, completion_tokens: 3, total_tokens: 7 },
+					});
+				}
+				return Response.json(completion(POD_MARKER));
+			}
+			if (request.method === "GET" && url.pathname === "/health") {
+				return new Response("ok", { status: 200 });
+			}
+			return Response.json(
+				{ error: { message: `pod worker: unexpected request ${request.method} ${url.pathname}` } },
+				{ status: 400 },
+			);
+		},
+	});
+	// The fake Runpod control plane the pod transport resolves addresses from.
+	// The pod's TCP mapping points at the fake llama server above, so the pod
+	// profile exercises the full delegation chain (control-plane lookup →
+	// TCP address → load-balanced transport → fake worker).
+	const podApiServer = Bun.serve({
+		port: 0,
+		fetch(request) {
+			const url = new URL(request.url);
+			podApiHits.push(`${request.method} ${url.pathname}`);
+			if (request.method === "GET" && url.pathname === "/v2/pods/pod_x") {
+				return Response.json({
+					id: "pod_x",
+					name: "smoke-pod",
+					status: "RUNNING",
+					cost: 1.19,
+					dataCenterId: "US-TX-1",
+					runtime: {
+						uptime: 3_600,
+						ports: [{ private: 8000, public: podLlamaServer.port, type: "tcp", ip: "127.0.0.1" }],
+					},
+				});
+			}
+			if (request.method === "GET" && url.pathname === "/v2/pods/pod_stopped") {
+				return Response.json({
+					id: "pod_stopped",
+					name: "smoke-stopped",
+					status: "EXITED",
+					cost: 0,
+					dataCenterId: "US-TX-1",
+					runtime: null,
+				});
+			}
+			return Response.json(
+				{ error: { message: `pod api: unexpected request ${request.method} ${url.pathname}` } },
+				{ status: 404 },
 			);
 		},
 	});
@@ -293,9 +399,25 @@ async function main(): Promise<void> {
 	// 3. Valid project config for the queue + load-balanced profiles.
 	const queuePort = queueServer.port;
 	const lbPort = lbServer.port;
+	const podApiPort = podApiServer.port;
 	const profile = (endpointType: "queue" | "load-balanced", url: string, modelId: string, modelName: string) => ({
 		endpointType,
 		invokeUrl: url,
+		model: {
+			id: modelId,
+			name: modelName,
+			contextWindow: 8192,
+			maxTokens: 512,
+			reasoning: false,
+			input: ["text"],
+			supportsTools: true,
+			supportsVision: false,
+		},
+		request: { mode: "sync" },
+	});
+	const podProfile = (podId: string, modelId: string, modelName: string) => ({
+		endpointType: "pod",
+		pod: { id: podId, port: 8000 },
 		model: {
 			id: modelId,
 			name: modelName,
@@ -313,6 +435,8 @@ async function main(): Promise<void> {
 		profiles: {
 			queue: profile("queue", `http://127.0.0.1:${queuePort}`, "meta-llama/llama-3.3-70b-instruct", "Smoke Queue"),
 			"load-balanced": profile("load-balanced", `http://127.0.0.1:${lbPort}`, "openai/gpt-4o-mini", "Smoke LB"),
+			pod: podProfile("pod_x", "teneburu/Qwen3.8-27B-UD-Q6_K_XL", "Smoke Pod"),
+			"pod-stopped": podProfile("pod_stopped", "teneburu/Qwen3.8-27B-UD-Q6_K_XL", "Smoke Pod Stopped"),
 		},
 	};
 	await writeFile(join(projDir, ".omp", "runpod.yml"), yamlStringify(document));
@@ -332,6 +456,8 @@ async function main(): Promise<void> {
 		HOME: agentDir,
 		PI_CODING_AGENT_DIR: agentDir,
 		RUNPOD_API_KEY: "runpod-omp-smoke-fake-key",
+		RUNPOD_CONTROL_BASE: `http://127.0.0.1:${podApiPort}`,
+		RUNPOD_OMP_LOG: join(projDir, "journal.jsonl"),
 		TERM: "dumb",
 	};
 
@@ -384,13 +510,15 @@ async function main(): Promise<void> {
 			.map((row) => row.selector)
 			.filter((selector): selector is string => selector !== undefined);
 		assert(
-			ids.includes("queue") && ids.includes("load-balanced"),
-			`native runpod models not registered; expected ids "queue" and "load-balanced", got [${ids.join(", ")}]`,
+			ids.includes("queue") && ids.includes("load-balanced") && ids.includes("pod"),
+			`native runpod models not registered; expected ids "queue", "load-balanced", and "pod", got [${ids.join(", ")}]`,
 			allOut,
 		);
 		assert(
-			selectors.includes("runpod/queue") && selectors.includes("runpod/load-balanced"),
-			`native runpod selectors not registered; expected "runpod/queue" and "runpod/load-balanced"`,
+			selectors.includes("runpod/queue") &&
+				selectors.includes("runpod/load-balanced") &&
+				selectors.includes("runpod/pod"),
+			`native runpod selectors not registered; expected "runpod/queue", "runpod/load-balanced", and "runpod/pod"`,
 			allOut,
 		);
 
@@ -430,16 +558,69 @@ async function main(): Promise<void> {
 			lbOut,
 		);
 
+		// ---- 6c. Pod model: control-plane lookup → TCP address → fake worker. ----
+		const podRes = await runOmp(
+			["-p", "--no-session", "--no-tools", "--model", "runpod/pod", "-e", loadedExtension, "reply only"],
+			env,
+			projDir,
+		);
+		const podOut = `${podRes.stdout}\n${podRes.stderr}`;
+		assert(
+			podApiHits.some((hit) => hit === "GET /v2/pods/pod_x"),
+			"pod model did not resolve the pod through the control plane (missing GET /v2/pods/pod_x)",
+			podOut,
+		);
+		assert(
+			podOut.includes(POD_MARKER),
+			`pod model did not return the fake pod worker response (missing marker "${POD_MARKER}")`,
+			podOut,
+		);
+
+		// ---- 6d. Pod model with tools: the worker receives the tool definitions
+		// and its tool-call completion is consumed without error. ----
+		const podToolsRes = await runOmp(
+			["-p", "--no-session", "--model", "runpod/pod", "-e", loadedExtension, "use a tool"],
+			env,
+			projDir,
+		);
+		assert(
+			sawPodTools,
+			"pod model did not forward tool definitions to the worker (fake worker never saw a tools array)",
+			`${podToolsRes.stdout}\n${podToolsRes.stderr}`,
+		);
+
+		// ---- 6e. Stopped pod: the actionable error surfaces and no stream starts. ----
+		const stoppedRes = await runOmp(
+			["-p", "--no-session", "--no-tools", "--model", "runpod/pod-stopped", "-e", loadedExtension, "reply only"],
+			env,
+			projDir,
+		);
+		const stoppedOut = `${stoppedRes.stdout}\n${stoppedRes.stderr}`;
+		assert(
+			stoppedOut.includes("pod_stopped is EXITED") && stoppedOut.includes("/runpod pod start"),
+			`stopped pod did not surface the actionable error (expected "pod_stopped is EXITED ... /runpod pod start")`,
+			stoppedOut,
+		);
+		assert(
+			!stoppedOut.includes(POD_MARKER),
+			"stopped pod unexpectedly streamed a completion",
+			stoppedOut,
+		);
+
 		// ---- 7. Status surface: not exercised (not CLI-drivable headlessly). ----
 		console.log(
 			"[smoke] /runpod status surface: not exercised — cannot be driven reliably through the real omp CLI non-interactively (slash commands are TUI-interactive); not simulated.",
 		);
 
-		console.log(`[smoke] PASS: queue->/runsync (${QUEUE_MARKER}), load-balanced->/v1/chat/completions (${LB_MARKER})`);
+		console.log(
+			`[smoke] PASS: queue->/runsync (${QUEUE_MARKER}), load-balanced->/v1/chat/completions (${LB_MARKER}), pod->control-plane+worker (${POD_MARKER}${sawPodTools ? " + tool call" : ""}), stopped-pod->actionable error`,
+		);
 		process.exitCode = 0;
 	} finally {
 		queueServer.stop(true);
 		lbServer.stop(true);
+		podLlamaServer.stop(true);
+		podApiServer.stop(true);
 		await rm(tmproot, { recursive: true, force: true });
 	}
 }

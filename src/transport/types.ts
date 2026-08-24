@@ -121,6 +121,32 @@ export function markRetryable(error: Error, retryable = true): Error {
 	(error as { retryable?: unknown }).retryable = retryable;
 	return error;
 }
+/**
+ * Resolve a secret reference string against an environment: `env:NAME`
+ * reads `NAME` (undefined when unset or empty), `!command` references
+ * cannot be executed inside a transport and throw explicitly (the plugin
+ * resolves them and injects the value via `deps.apiKey`), and a bare name
+ * reads the environment variable, falling back to the literal name when
+ * the variable is unset. Returns undefined when nothing resolves.
+ */
+export function resolveSecretRef(ref: string, env: NodeJS.ProcessEnv): string | undefined {
+	if (ref.startsWith("env:")) {
+		const name = ref.slice("env:".length);
+		const value = name.length > 0 ? env[name] : undefined;
+		return value !== undefined && value.length > 0 ? value : undefined;
+	}
+	if (ref.startsWith("!")) {
+		throw new Error(
+			"Runpod secret reference cannot be resolved by the transport; " +
+				"command references are resolved by the plugin and passed via deps.apiKey",
+		);
+	}
+	const value = ref.length > 0 ? env[ref] : undefined;
+	if (value !== undefined && value.length > 0) {
+		return value;
+	}
+	return ref.length > 0 ? ref : undefined;
+}
 
 /** Injectable runtime dependencies for a transport adapter. */
 export interface TransportDeps {
@@ -134,6 +160,13 @@ export interface TransportDeps {
 	apiKey?: string;
 	/** Abort signal forwarded to fetch, e.g. from the OMP session. */
 	signal?: AbortSignal;
+	/**
+	 * When true, the `RUNPOD_API_KEY` environment fallback is suppressed in
+	 * bearer resolution. Set by the pod transport: for pod profiles that env
+	 * var holds the account-scoped control key, which must never reach the
+	 * worker when no inference token is configured.
+	 */
+	noEnvKeyFallback?: boolean;
 }
 
 /**

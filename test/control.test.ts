@@ -746,3 +746,122 @@ function assertRedacted(outcome: ControlOutcome, sensitive: readonly string[]): 
 		expect(outcome.detail).not.toContain(fragment);
 	}
 }
+
+describe("executeControl (pod operations)", () => {
+	const CONTROL_BASE = "https://control.test";
+
+	function podProfile(overrides: { podId?: string; endpointType?: "pod" | "queue" } = {}): ControlProfile {
+		return {
+			endpointType: overrides.endpointType ?? "pod",
+			invokeUrl: "",
+			apiKey: API_KEY_REF,
+			controlBaseUrl: CONTROL_BASE,
+			podId: overrides.podId ?? "pod_abc123",
+		};
+	}
+
+	const POD_BODY = {
+		id: "pod_abc123",
+		name: "qwen-subs",
+		status: "RUNNING",
+		cost: 1.19,
+		dataCenterId: "US-TX-1",
+		runtime: { uptime: 7_200, ports: [{ private: 8000, public: 43210, type: "tcp", ip: "45.23.12.1" }] },
+	};
+
+	test("pod-status: GET /v2/pods/<podId> and normalizes the bare Pod", async () => {
+		const { calls, fetchMock } = recordingFetch(() => jsonResponse(POD_BODY));
+
+		const outcome = await executeControl(podProfile(), { operation: "pod-status" }, { fetch: fetchMock, resolveKey });
+
+		const call = expectCall(calls, 0, "GET", `${CONTROL_BASE}/v2/pods/pod_abc123`);
+		expect(new Headers(call.init?.headers).get("authorization")).toBe(`Bearer ${API_TOKEN}`);
+		expect(outcome).toMatchObject({
+			ok: true,
+			operation: "pod-status",
+			pod: {
+				id: "pod_abc123",
+				name: "qwen-subs",
+				status: "RUNNING",
+				costPerHour: 1.19,
+				uptimeSeconds: 7_200,
+				dataCenterId: "US-TX-1",
+			},
+		});
+	});
+
+	test("pod-start: POST /v2/pods/<podId>/action with the action body and returns the updated pod", async () => {
+		const { calls, fetchMock } = recordingFetch(() =>
+			jsonResponse({ ...POD_BODY, status: "STARTING", cost: 0, runtime: null }),
+		);
+
+		const outcome = await executeControl(podProfile(), { operation: "pod-start" }, { fetch: fetchMock, resolveKey });
+
+		const call = expectCall(calls, 0, "POST", `${CONTROL_BASE}/v2/pods/pod_abc123/action`);
+		const headers = new Headers(call.init?.headers);
+		expect(headers.get("authorization")).toBe(`Bearer ${API_TOKEN}`);
+		expect(headers.get("content-type")).toContain("application/json");
+		expect(JSON.parse(String(call.init?.body))).toEqual({ action: "start" });
+		expect(outcome).toMatchObject({
+			ok: true,
+			operation: "pod-start",
+			pod: { status: "STARTING", costPerHour: 0, uptimeSeconds: null },
+		});
+	});
+
+	test("pod-stop and pod-restart post their own actions", async () => {
+		const { fetchMock } = recordingFetch((call) => {
+			const body = JSON.parse(String(call.init?.body)) as { action: string };
+			return jsonResponse({ ...POD_BODY, status: body.action === "stop" ? "EXITED" : "RUNNING" });
+		});
+		const stop = await executeControl(podProfile(), { operation: "pod-stop" }, { fetch: fetchMock, resolveKey });
+		expect(stop).toMatchObject({ ok: true, operation: "pod-stop", pod: { status: "EXITED" } });
+		const restart = await executeControl(podProfile(), { operation: "pod-restart" }, { fetch: fetchMock, resolveKey });
+		expect(restart).toMatchObject({ ok: true, operation: "pod-restart", pod: { status: "RUNNING" } });
+	});
+
+	test("a lenient pod body defaults missing fields without throwing", async () => {
+		const { fetchMock } = recordingFetch(() => jsonResponse({ id: "pod_abc123" }));
+
+		const outcome = await executeControl(podProfile(), { operation: "pod-status" }, { fetch: fetchMock, resolveKey });
+
+		expect(outcome).toMatchObject({
+			ok: true,
+			operation: "pod-status",
+			pod: { id: "pod_abc123", name: "", status: "ERROR", costPerHour: 0, uptimeSeconds: null, dataCenterId: null },
+		});
+	});
+
+	test("pod operations are unsupported on non-pod profiles with zero fetch", async () => {
+		const { calls, fetchMock } = recordingFetch(() => jsonResponse({}));
+
+		const outcome = await executeControl(
+			podProfile({ endpointType: "queue" }),
+			{ operation: "pod-status" },
+			{ fetch: fetchMock, resolveKey },
+		);
+
+		expect(outcome).toMatchObject({
+			ok: false,
+			operation: "pod-status",
+			supported: false,
+			reason: "This operation is only available on pod profiles.",
+		});
+		expect(calls).toEqual([]);
+	});
+
+	test("pod billing uses /v2/billing/pods with podId instead of the serverless route", async () => {
+		const { calls, fetchMock } = recordingFetch(() => jsonResponse({ records: [] }));
+
+		const outcome = await executeControl(podProfile(), { operation: "billing" }, { fetch: fetchMock, resolveKey });
+
+		const call = expectCall(
+			calls,
+			0,
+			"GET",
+			`${CONTROL_BASE}/v2/billing/pods?podId=pod_abc123&bucketSize=hour&lastN=24`,
+		);
+		expect(new Headers(call.init?.headers).get("authorization")).toBe(`Bearer ${API_TOKEN}`);
+		expect(outcome).toMatchObject({ ok: true, operation: "billing", records: [] });
+	});
+});

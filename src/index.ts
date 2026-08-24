@@ -41,6 +41,7 @@ import { loadRunpodProfiles, writeProfileDocument } from "./config.js";
 import type { MergedProfiles } from "./config.js";
 import { parseProfileDocument } from "./profile-schema.js";
 import type {
+	EndpointType,
 	ModelMetadata,
 	Profile,
 	ProfileValidationError,
@@ -57,10 +58,14 @@ import type {
 import { registerRunpodTools } from "./operations.js";
 import type {
 	RunpodControl,
+	RunpodPodProbe,
 	RunpodTool,
 	RunpodToolDetails,
 	ToolRegistrationApi,
 } from "./operations.js";
+import type { NormalizedPodStatus } from "./control.js";
+import { resolvePodHttpAddress, probePodHealth } from "./transport/pod.js";
+import type { TransportDeps } from "./transport/types.js";
 import { RUNPOD_CONTROL_BASE, executeControl } from "./control.js";
 import { createCostService } from "./cost.js";
 import type { CostService } from "./cost.js";
@@ -68,7 +73,7 @@ import { registerRunpodLifecycle, runpodStatusText } from "./lifecycle.js";
 import type { RunpodSessionContext } from "./lifecycle.js";
 
 /** Display label shown in OMP's extension list. */
-const EXTENSION_LABEL = "runpod — Runpod queue & load-balanced provider profiles";
+const EXTENSION_LABEL = "runpod — Runpod queue, load-balanced & pod provider profiles";
 
 /**
  * Registration hooks for the Runpod feature modules (config, provider,
@@ -239,6 +244,19 @@ function buildConfigRuntime(
 			}
 			return costService.report(profileName, profile.endpointType);
 		},
+		async runPodOperation(profileName, operation) {
+			const outcome = await createControlWrapper(state.profiles)(profileName, { operation });
+			if (!outcome.ok) {
+				throw new Error(outcome.supported ? outcome.detail : outcome.reason);
+			}
+			if (!("pod" in outcome) || outcome.operation !== operation) {
+				throw new Error("Unexpected control outcome.");
+			}
+			return outcome.pod;
+		},
+		// The probe reads the live `state.profiles` at call time so a config
+		// reload immediately affects pod status reports.
+		podProbe: (profileName) => createPodProbe(state.profiles)(profileName),
 		notify,
 		configPath(scope: ConfigTargetScope): string {
 			return scope === "global" ? globalPath : projectPath;
@@ -265,15 +283,27 @@ function buildConfigRuntime(
 				[
 					{ label: "queue", description: "Async queue endpoint (job-based)" },
 					{ label: "load-balanced", description: "Sync load-balanced HTTP endpoint" },
+					{
+						label: "pod",
+						description: "Dedicated Runpod pod (public TCP address auto-derived)",
+					},
 				],
 			);
-			const endpointType =
-				typeof endpointLabel === "string" &&
-				endpointLabel.toLowerCase() === "load-balanced"
+			const normalizedEndpoint =
+				typeof endpointLabel === "string" ? endpointLabel.toLowerCase() : "";
+			const endpointType: EndpointType =
+				normalizedEndpoint === "load-balanced"
 					? "load-balanced"
-					: "queue";
-			const invokeUrl = await ui.input("Runpod endpoint invoke URL");
-			if (typeof invokeUrl !== "string" || invokeUrl.trim() === "") {
+					: normalizedEndpoint === "pod"
+						? "pod"
+						: "queue";
+			const invokeUrl = await ui.input(
+				"Runpod endpoint invoke URL (optional for pods; empty = auto-derived TCP address)",
+			);
+			if (
+				endpointType !== "pod" &&
+				(typeof invokeUrl !== "string" || invokeUrl.trim() === "")
+			) {
 				// Incomplete prompt: fail closed with no write.
 				return { cancelled: true };
 			}
@@ -281,14 +311,41 @@ function buildConfigRuntime(
 				"Runpod API key reference (env:VAR, !cmd, or literal; empty for none)",
 			);
 			const ref = typeof apiKeyRef === "string" ? apiKeyRef.trim() : "";
+			let pod: { id: string; port: number; inferenceApiKeyRef: string | null } | undefined;
+			if (endpointType === "pod") {
+				const podId = await ui.input("Runpod pod id (e.g. pod_abc123)");
+				if (typeof podId !== "string" || podId.trim() === "") {
+					return { cancelled: true };
+				}
+				const portInput = await ui.input("Internal llama.cpp port (default 8000)");
+				const port =
+					typeof portInput === "string" && portInput.trim() !== ""
+						? Number.parseInt(portInput.trim(), 10)
+						: 8000;
+				if (!Number.isInteger(port) || port <= 0) {
+					return { cancelled: true };
+				}
+				const inferenceKeyInput = await ui.input(
+					"Pod inference API key reference (env:VAR, !cmd, literal; empty for keyless)",
+				);
+				const inferenceApiKeyRef =
+					typeof inferenceKeyInput === "string" && inferenceKeyInput.trim() !== ""
+						? inferenceKeyInput.trim()
+						: null;
+				pod = { id: podId.trim(), port, inferenceApiKeyRef };
+			}
 			return {
 				cancelled: false,
 				values: {
 					name,
 					endpointType,
-					invokeUrl: invokeUrl.trim(),
+					invokeUrl:
+						typeof invokeUrl === "string" && invokeUrl.trim() !== ""
+							? invokeUrl.trim()
+							: undefined,
 					model: DEFAULT_GUIDED_MODEL,
 					apiKeyRef: ref.length > 0 ? ref : null,
+					pod,
 				},
 			};
 		},
@@ -396,6 +453,51 @@ function resolveControlKey(ref: SecretReference): string | undefined {
 }
 
 /**
+ * Resolve a pod profile's control key: the profile's own reference first,
+ * then the `RUNPOD_API_KEY` env fallback (mirroring the provider-level key
+ * precedence). Used only for the pod API address lookup; never forwarded to
+ * the worker.
+ */
+function resolvePodControlKey(profile: Profile): string | undefined {
+	if (profile.apiKey !== undefined) {
+		return resolveControlKey(profile.apiKey);
+	}
+	const fallback = process.env.RUNPOD_API_KEY;
+	return fallback !== undefined && fallback !== "" ? fallback : undefined;
+}
+
+/**
+ * Build the pod probe used by the `runpod_pod` tool and `/runpod pod` report:
+ * resolve the worker's HTTP address (control key), then probe `/health` with
+ * the inference token. Never throws; failures carry a deterministic reason.
+ */
+function createPodProbe(profiles: Record<string, Profile>): RunpodPodProbe {
+	return async (profileName) => {
+		const profile = profiles[profileName];
+		if (profile === undefined) {
+			return {
+				health: "unhealthy",
+				reason: "No profile matched the supplied profile name.",
+			};
+		}
+		const deps: TransportDeps = { apiKey: resolvePodControlKey(profile) };
+		try {
+			const address = await resolvePodHttpAddress(profile, deps);
+			const health = await probePodHealth(profile, deps);
+			return { address, health };
+		} catch (error) {
+			return {
+				health: "unhealthy",
+				reason:
+					error instanceof Error && error.message.length > 0
+						? error.message
+						: "pod probe failed",
+			};
+		}
+	};
+}
+
+/**
  * Build the control dispatcher the tool layer is wired with. It resolves the
  * target profile by name ONLY when a tool execute handler runs — at factory
  * time nothing is looked up, fetched, or key-resolved. An unknown profile
@@ -415,7 +517,9 @@ function createControlWrapper(profiles: Record<string, Profile>): RunpodControl 
 		return executeControl(
 			{
 				endpointType: profile.endpointType,
-				invokeUrl: profile.invokeUrl,
+				// Pod profiles carry no static invokeUrl; their control ops use
+				// the explicit pod id, so an empty string is never consulted.
+				invokeUrl: profile.invokeUrl ?? "",
 				apiKey: profile.apiKey,
 				controlBaseUrl: RUNPOD_CONTROL_BASE,
 			},
@@ -544,8 +648,14 @@ export default async function runpodExtension(pi: ExtensionAPI): Promise<void> {
 
 	// Register the read-only operational tools, adapted onto OMP's
 	// `registerTool` surface. Their control dispatcher defers all profile
-	// lookup, network, and key resolution until a tool execute call.
-	registerRunpodTools(adaptToolApi(pi), state.profiles, createControlWrapper(state.profiles));
+	// lookup, network, and key resolution until a tool execute call. The pod
+	// probe (readiness + address) is wired only when a pod profile exists.
+	registerRunpodTools(
+		adaptToolApi(pi),
+		state.profiles,
+		createControlWrapper(state.profiles),
+		createPodProbe(state.profiles),
+	);
 
 	// Map the active session model to the configured runpod profile id. It
 	// reads the real OMP `ctx.model` (a `Model` object) and tolerates the

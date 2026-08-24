@@ -14,9 +14,11 @@ no hard-coded endpoints.
 
 - Native `runpod` provider models: one selectable `runpod/<profile>` model for
   each configured profile.
-- Managed-queue and load-balanced endpoint transports.
+- Managed-queue, load-balanced, and pod endpoint transports (pod profiles
+  resolve the worker's public TCP address from the control plane at call
+  time).
 - `/runpod` profile, configuration, diagnostics, explicit human queue control,
-  and cost commands.
+  pod lifecycle, and cost commands.
 - Read-only operational tools for the model.
 - Live cost estimation in the session status line and `/runpod cost`.
 
@@ -110,6 +112,65 @@ profiles:
       supportsVision: true
 ```
 
+### Example: main + subs as pods (two profiles, one pod each)
+
+The same topology on dedicated **pods**: one profile per pod, the subs pod
+serving the Q6 quant. The plugin resolves the pod's public TCP address at call
+time (`GET /v2/pods/<id>` → `runtime.ports`), so no static URL is needed —
+the port mapping is read live and follows pod restarts.
+
+```yaml
+version: 1
+profiles:
+  qwen3.8-27b:
+    endpointType: pod
+    pod:
+      id: pod_<main-pod-id>
+      port: 8000            # internal llama.cpp port (default 8000)
+      inferenceApiKey: env:POD_INFERENCE_KEY   # optional; absent = keyless
+    apiKey: env:RUNPOD_API_KEY                 # control-plane key (pod API)
+    model:
+      id: Qwen3.8-27B-UD-Q8_K_XL
+      name: Qwen3.8 27B (Runpod pod)
+      contextWindow: 262144
+      maxTokens: 12288
+      reasoning: true
+      input: [text, image]
+      supportsTools: true
+      supportsVision: true
+    request:
+      mode: stream
+      loadBalancedPath: /v1/chat/completions
+
+  qwen3.8-subs:
+    endpointType: pod
+    pod:
+      id: pod_<subs-pod-id>
+      port: 8000
+    apiKey: env:RUNPOD_API_KEY
+    model:
+      id: Qwen3.8-27B-UD-Q6_K_XL
+      name: Qwen3.8 27B (Runpod pod subs, Q6)
+      contextWindow: 131072
+      maxTokens: 8192
+      reasoning: true
+      input: [text, image]
+      supportsTools: true
+      supportsVision: true
+    request:
+      mode: stream
+      loadBalancedPath: /v1/chat/completions
+```
+
+Key separation: the profile's `apiKey` is the **control-plane key** (pod API +
+billing); the optional `pod.inferenceApiKey` is the only credential forwarded
+to the worker (llama.cpp `--api-key`). A keyless pod sends no Authorization
+header, and the control key never reaches the worker — the `RUNPOD_API_KEY`
+env fallback is suppressed on the inference path on purpose. Deploy the pod
+with its llama port exposed as a **TCP** port; if only the HTTP proxy
+(`https://<pod-id>-<port>.proxy.runpod.net`) is available, set a static
+`invokeUrl` override instead (see below).
+
 ### Example: main + subs (load-balanced, two concurrency profiles)
 
 A production pattern is one model exposed through two Runpod load-balanced
@@ -190,8 +251,11 @@ must be an absolute `http(s)` URL; its exact spelling is preserved verbatim.
 
 | Field | Type / allowed values | Required | Default |
 | --- | --- | --- | --- |
-| `endpointType` | `queue` \| `load-balanced` | yes | — |
-| `invokeUrl` | absolute `http(s)` URL | yes | — |
+| `endpointType` | `queue` \| `load-balanced` \| `pod` | yes | — |
+| `invokeUrl` | absolute `http(s)` URL | queue/load-balanced yes; pod no | none |
+| `pod.id` | non-empty string (Runpod pod id) | endpointType `pod` | — |
+| `pod.port` | positive integer | no | `8000` |
+| `pod.inferenceApiKey` | string or `{ ref }` (see API keys) | no | none |
 | `apiKey` | string or `{ ref }` (see API keys) | no | none |
 | `model.id` | non-empty string | yes | — |
 | `model.name` | non-empty string | yes | — |
@@ -286,14 +350,38 @@ Queue jobs report native statuses (`IN_QUEUE`, `IN_PROGRESS`, `COMPLETED`,
 `failed`/`cancelled`/`timed_out` jobs surface as explicit errors naming the
 job and status, with any server-provided detail.
 
-### Load-balanced (`endpointType: load-balanced`)
+### Pod (`endpointType: pod`)
 
-`invokeUrl` is the endpoint's direct URL (e.g. a `*.proxy.runpod.net`
-address). Requests are a single OpenAI-compatible HTTP call to
-`invokeUrl + request.loadBalancedPath` (default `/v1/chat/completions`).
-Response parsing follows `request.mode`: a JSON completion body for `sync`, an
-SSE `text/event-stream` for `stream`. There is no queue to poll, so `async`
-does not apply to a load-balanced endpoint.
+A pod profile targets a dedicated Runpod pod running llama.cpp. The worker's
+HTTP base is resolved at call time:
+
+- **TCP mode (default)** — `GET /v2/pods/<pod.id>` with the control key
+  (profile `apiKey`, else `RUNPOD_API_KEY`): the pod must be `RUNNING`, and
+  the `runtime.ports` entry for `pod.port` (falling back to the first TCP
+  entry with an ip + public pair) yields `http://<ip>:<public>`. The address
+  changes when the pod resets; it is re-derived per call, so a restart is
+  invisible to the profile. A non-running pod fails with an actionable error
+  naming the state and the `/runpod pod start` remedy.
+- **Static mode** — a configured `invokeUrl` (e.g. the HTTP proxy URL
+  `https://<pod-id>-<internal-port>.proxy.runpod.net` or a tunnel) is used
+  verbatim and no control-plane lookup happens.
+
+The HTTP call itself is the load-balanced transport, so `request.mode`
+`sync`/`stream`, tool calling, retries, and `policy.fallbackProfiles` all
+behave identically (`async` does not apply). The proxy URL form is HTTPS-only
+with a Cloudflare 100 s cap; the TCP form has no such cap, which is why it is
+the default.
+
+### Health & control probes
+
+- **queue**: `GET /health` → a normalized worker summary (counts are `unknown`
+  when not reported, with a short-TTL cache).
+- **load-balanced**: `GET /ping` → HTTP 200 is `healthy`, 204 is
+  `initializing`, anything else (or a transport failure) is `unhealthy`.
+- **pod**: `GET <resolved address>/health` (with the inference token when
+  configured) → HTTP 200 is `healthy`, 204 is `initializing`, anything else
+  (or a resolution failure) is `unhealthy`. Never throws; a stopped pod reads
+  `unhealthy` with the actionable reason.
 
 ### Health & control probes
 
@@ -319,6 +407,11 @@ One slash command namespace is registered: `/runpod`.
 | `/runpod retry <profile> <id>` | Retry a queue job after interactive confirmation. |
 | `/runpod purge <profile>` | Purge pending queue jobs after interactive confirmation. |
 | `/runpod cost [profile]` | Fresh cost report: live estimate (workers × serverless price) plus actual billed amounts (last 24h + current hour). Read-only. |
+| `/runpod pod` | List pod profiles with live control-plane states. |
+| `/runpod pod <profile>` | Full pod report: state, uptime, `$X.XX/hr`, data center, resolved HTTP address, readiness. Read-only. |
+| `/runpod pod start <profile>` | Start the pod after interactive confirmation. |
+| `/runpod pod stop <profile>` | Stop the pod after interactive confirmation (the manual cost lever — Runpod has no native idle auto-stop). |
+| `/runpod pod restart <profile>` | Restart the pod after interactive confirmation. |
 
 Runpod serverless is **time-billed**, so profiles carry no token prices. OMP's
 model metadata registers a zero structural cost; real cost surfaces live in the
@@ -335,10 +428,20 @@ shows the most up-to-date numbers available:
   (USD/hour), plus accrued spend from each worker's uptime. Updated from the
   live worker list; marked `(N of M workers priced)` when a worker's GPU has
   no catalog price, and never guessed.
+- **Live (pod)** — for `endpointType: pod`, the live section comes from the
+  pod API itself: `Pod.cost` (USD/hour; 0 when the pod is stopped) with
+  accrued = rate × uptime. Rendered as `Live (pod): $X.XX/hr · ~$Y accrued
+  (state RUNNING)`; no GPU-catalog lookup is involved.
 - **Billed (actual)** — per-endpoint billing history, last 24 hourly buckets
   with the current hour's bucket called out, broken out by GPU, disk, and
-  platform fee. The billing API lags the live state by the platform's ~5
-  minute billing cycle, which is why the estimate sits alongside it.
+  platform fee. Pod profiles narrow the billing call with `podId`. The
+  billing API lags the live state by the platform's ~5 minute billing cycle,
+  which is why the estimate sits alongside it.
+
+Runpod pods are billed **per minute while running** (disk-only while
+stopped), so pod cost control is manual: stop the pod when done
+(`/runpod pod stop`, or a creation-time `stop-after` guard) — Runpod has no
+native idle-based auto-stop, and the plugin deliberately does not add one.
 
 Cost surfaces call the Runpod REST v2 control plane (`api.runpod.io/v2`) with
 the profile's resolved API key, so the key needs control-plane/billing scope;
@@ -369,11 +472,14 @@ include key material.
 | `runpod_health` | read | queue | `GET /health` | no |
 | `runpod_ping` | read | load-balanced | `GET /ping` | no |
 | `runpod_status` | read | any | `GET /status/<id>` | yes |
+| `runpod_pod` | read | pod | pod state + address + readiness | no |
 
 - Tools register only when a profile of the matching endpoint family exists.
   `runpod_status` registers when any profile exists and reports
   `supported: false` for targets that cannot serve it, such as a
-  load-balanced profile.
+  load-balanced profile. `runpod_pod` registers only when at least one pod
+  profile exists; it reports state, `$X.XX/hr`, uptime, data center, the
+  resolved worker address (public pod data, not a secret), and readiness.
 
 ## Human queue control
 
