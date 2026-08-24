@@ -1,71 +1,121 @@
 # @cyb3rcore/runpod-omp
 
-An [OMP](https://omp.sh) extension package that registers a native `runpod`
-provider: **one model per configured Runpod profile** (`runpod/<profile>` in
-OMP's model picker). Each profile declares how its Runpod endpoint is invoked —
-either a **managed-queue** endpoint (`/run`, `/runsync`, `/status`, `/stream`,
-`/cancel`, …) or a **load-balanced** endpoint (direct OpenAI-compatible HTTP) —
-plus its model metadata, request mode, and retry/fallback policy.
+An [OMP](https://omp.sh) extension that registers a native `runpod` provider:
+one model per configured profile, selectable as `runpod/<profile>` in OMP's
+model picker. Profiles target three Runpod endpoint kinds — **managed-queue**,
+**load-balanced**, and **pod** — and declare their model metadata, request
+mode, and retry/fallback policy in versioned YAML. No code; no hard-coded
+endpoints.
 
-Everything is configured through versioned YAML profiles, not code. There are
-no hard-coded endpoints.
+## Table of contents
 
-## What it adds
+- [Which endpoint type?](#which-endpoint-type)
+- [Install](#install)
+- [Configuration](#configuration)
+- [Endpoints](#endpoints)
+- [Provider: runpod/&lt;profile&gt;](#provider-runpodprofile)
+- [Commands](#commands)
+- [Cost](#cost)
+- [Operational tools](#operational-tools)
+- [Human queue control](#human-queue-control)
+- [Observability](#observability)
+- [Security model](#security-model)
+- [Development](#development)
 
-- Native `runpod` provider models: one selectable `runpod/<profile>` model for
-  each configured profile.
-- Managed-queue, load-balanced, and pod endpoint transports (pod profiles
-  resolve the worker's public TCP address from the control plane at call
-  time).
-- `/runpod` profile, configuration, diagnostics, explicit human queue control,
-  pod lifecycle, and cost commands.
-- Read-only operational tools for the model.
-- Live cost estimation in the session status line and `/runpod cost`.
+## Which endpoint type?
+
+| `endpointType` | Use when | How requests reach the worker | Cost basis |
+| --- | --- | --- | --- |
+| `queue` | Managed serverless job queue | Runpod queue API (`/run`, `/runsync`, `/status`, `/stream`) | Workers × catalog `price.serverless` |
+| `load-balanced` | Direct serverless HTTP | Static `invokeUrl` + OpenAI-compatible path | Workers × catalog `price.serverless` |
+| `pod` | Dedicated pod; one profile per pod | Control-plane TCP resolution at call time, or static `invokeUrl` | `Pod.cost` USD/hour, accrued from uptime |
+
+Queue and load-balanced profiles require a static `invokeUrl`. Pod profiles
+resolve the worker's public TCP address from `GET /v2/pods/<id>` on every call,
+so they need none — the address follows pod restarts automatically.
 
 ## Install
-
-Install the package through OMP:
 
 ```sh
 omp plugin install @cyb3rcore/runpod-omp
 ```
 
-Then start OMP and run `/runpod configure` to create a profile. The guided flow
-validates the endpoint, writes either the global or project configuration
-atomically, and does not resolve or store a secret. Restart or refresh the
-session after a configuration change; OMP registers native provider models when
-the extension loads. Select `runpod/<profile>` in OMP's model picker.
-
-For a declarative setup, create either `<agent-dir>/runpod.yml` or
-`<project>/.omp/runpod.yml` as described in [Configuration](#configuration).
-
-## Development
-
-Requires [Bun](https://bun.sh) (`>=1.3.14`, see `package.json#engines`).
-
-```sh
-bun install
-bun test          # unit and contract tests
-bun run build     # TypeScript and declarations
-bun run smoke     # local endpoints with the real OMP CLI
-bun run verify    # test, build, and smoke
-```
+Run `/runpod configure` inside OMP to create a profile, or write
+`<agent-dir>/runpod.yml` / `<project>/.omp/runpod.yml` by hand (see
+[Configuration](#configuration)). OMP registers the `runpod/<profile>` models
+when the extension loads; **restart or refresh the session after a config
+change**. The guided flow validates input, writes atomically, and never
+resolves or stores a secret.
 
 ## Configuration
 
-Profiles are declared in versioned YAML (`version: 1`) and merged from two
-layers:
+Profiles live in versioned YAML (`version: 1`) and merge from two layers:
 
-- **global**: `<agent-dir>/runpod.yml`
-- **project**: `<cwd>/.omp/runpod.yml` — same-named profiles override global
-  ones; global-only profiles are kept; project-only profiles are added.
+- **global** — `<agent-dir>/runpod.yml` (agent dir from `PI_CODING_AGENT_DIR`,
+  else OMP's default)
+- **project** — `<cwd>/.omp/runpod.yml`; same-named profiles override global
+  ones
 
-The agent directory derives from `PI_CODING_AGENT_DIR` if set, otherwise OMP's
-default agent directory. A missing file is an empty layer; a malformed layer
-contributes no profiles while its validation errors are retained (the other
-layer stays active).
+A missing file is an empty layer. A malformed layer contributes no profiles and
+retains its validation errors; the other layer stays active.
 
-### Profile example
+### Schema
+
+Every `model` field is required; `request` and `policy` fall back to planned
+defaults. `invokeUrl` must be an absolute `http(s)` URL, preserved verbatim.
+
+| Field | Type / allowed values | Required | Default |
+| --- | --- | --- | --- |
+| `endpointType` | `queue` \| `load-balanced` \| `pod` | yes | — |
+| `invokeUrl` | absolute `http(s)` URL | queue/load-balanced yes; pod no | none |
+| `pod.id` | non-empty string (Runpod pod id) | endpointType `pod` | — |
+| `pod.port` | positive integer | no | `8000` |
+| `pod.inferenceApiKey` | string or `{ ref }` (see API keys) | no | none |
+| `apiKey` | string or `{ ref }` (see API keys) | no | none |
+| `model.id` | non-empty string | yes | — |
+| `model.name` | non-empty string | yes | — |
+| `model.contextWindow` | positive integer | yes | — |
+| `model.maxTokens` | positive integer | yes | — |
+| `model.reasoning` | boolean | yes | — |
+| `model.input` | non-empty array of `text` / `image` | yes | — |
+| `model.supportsTools` | boolean | yes | — |
+| `model.supportsVision` | boolean | yes | — |
+| `request.mode` | `sync` \| `async` \| `stream` | no | `sync` |
+| `request.timeoutMs` | number > 0 | no | `300000` |
+| `request.polling.intervalMs` | number > 0 | no | `1000` |
+| `request.polling.ttlMs` | number > 0 | no | `1800000` |
+| `request.polling.focusAware` | boolean | no | `true` |
+| `request.queueAdapter.kind` | `openai-shaped` \| `messages-text` \| `module` | no | `openai-shaped` |
+| `request.queueAdapter.module` | non-empty string (kind `module`) | kind `module` | — |
+| `request.queueAdapter.export` | non-empty string | no | `adapter` |
+| `request.loadBalancedPath` | non-empty string | no | `/v1/chat/completions` |
+| `policy.maxAttempts` | positive integer | no | `1` |
+| `policy.fallbackProfiles` | array of profile names | no | `[]` |
+
+### API keys
+
+`apiKey` is a reference, never a stored credential. Accepted forms, all
+normalized to an unresolved reference:
+
+- `apiKey: NAME` — environment variable, falling back to the literal `NAME`
+  (OMP-custom-provider style)
+- `apiKey: env:NAME` — explicit environment reference
+- `apiKey: "!<command>"` — command reference; trimmed stdout is the key
+- `apiKey: { ref: env:NAME }` — reference object (canonical form)
+
+Resolution precedence per call: **profile `apiKey` → OMP-provided key →
+`RUNPOD_API_KEY`**. An empty `env:` reference falls through to the next
+source; a failing `!command` is an explicit error and never falls back. Every
+diagnostic, serialized profile, and tool result strips key material to a
+fixed `[redacted]` marker. Stream errors surface the underlying cause with
+only known credential bytes redacted (see [Security model](#security-model)).
+
+### Examples
+
+Full profile examples, collapsed:
+
+<details>
+<summary>Single queue profile (managed endpoint)</summary>
 
 ```yaml
 version: 1
@@ -96,28 +146,26 @@ profiles:
     policy:
       maxAttempts: 1
       fallbackProfiles: []
-
-  my-lb:
-    endpointType: load-balanced
-    invokeUrl: https://xyz123.proxy.runpod.net
-    apiKey: RUNPOD_API_KEY   # an environment-variable name (see API keys)
-    model:
-      id: runpod/my-vlm
-      name: My Load-Balanced VLM
-      contextWindow: 8192
-      maxTokens: 2048
-      reasoning: false
-      input: [text, image]
-      supportsTools: true
-      supportsVision: true
 ```
 
-### Example: main + subs as pods (two profiles, one pod each)
+</details>
 
-The same topology on dedicated **pods**: one profile per pod, the subs pod
-serving the Q6 quant. The plugin resolves the pod's public TCP address at call
-time (`GET /v2/pods/<id>` → `runtime.ports`), so no static URL is needed —
-the port mapping is read live and follows pod restarts.
+<details>
+<summary>Main + subs as pods (two profiles, one pod each)</summary>
+
+One profile per pod; the subs pod serves the Q6 quant. No `invokeUrl` — the
+plugin resolves each pod's public TCP address at call time, so restarts need
+no config change.
+
+**Key separation**: `apiKey` is the control-plane key (pod API + billing);
+`pod.inferenceApiKey` (optional) is the only credential forwarded to the
+worker (llama.cpp `--api-key`). A keyless pod sends no Authorization header;
+the control key never reaches the worker, and the `RUNPOD_API_KEY` env
+fallback is suppressed on the inference path on purpose.
+
+Deploy the pod with its llama port exposed as a **TCP** port. If only the
+HTTP proxy (`https://<pod-id>-<port>.proxy.runpod.net`) is available, set a
+static `invokeUrl` override instead.
 
 ```yaml
 version: 1
@@ -162,23 +210,17 @@ profiles:
       loadBalancedPath: /v1/chat/completions
 ```
 
-Key separation: the profile's `apiKey` is the **control-plane key** (pod API +
-billing); the optional `pod.inferenceApiKey` is the only credential forwarded
-to the worker (llama.cpp `--api-key`). A keyless pod sends no Authorization
-header, and the control key never reaches the worker — the `RUNPOD_API_KEY`
-env fallback is suppressed on the inference path on purpose. Deploy the pod
-with its llama port exposed as a **TCP** port; if only the HTTP proxy
-(`https://<pod-id>-<port>.proxy.runpod.net`) is available, set a static
-`invokeUrl` override instead (see below).
+</details>
 
-### Example: main + subs (load-balanced, two concurrency profiles)
+<details>
+<summary>Main + subs as load-balanced endpoints (two concurrency profiles)</summary>
 
-A production pattern is one model exposed through two Runpod load-balanced
-endpoints with different concurrency budgets: a **main** profile for the coding
-agent (long context, one slot) and a **subs** profile for parallel subagents
-(many slots, bounded context). Both point at the same GGUF-backed llama.cpp
-server image, differing only in the endpoint's server-side `CTX_SIZE` /
-`PARALLEL` environment and the profile's `contextWindow`.
+The same topology on serverless: a **main** profile for the coding agent
+(long context, one slot) and a **subs** profile for parallel subagents (many
+slots, bounded context). Both point at the same llama.cpp server image; the
+endpoint's server-side `CTX_SIZE` / `PARALLEL` environment enforces the
+concurrency split, and the profile's `contextWindow` must match the
+endpoint's per-slot `CTX_SIZE`.
 
 ```yaml
 version: 1
@@ -218,119 +260,47 @@ profiles:
       loadBalancedPath: /v1/chat/completions
 ```
 
-The server-side concurrency split is enforced by the endpoint, not the profile:
-the main endpoint runs `PARALLEL=1, CTX_SIZE=262144` on the Q8 quant (one
-long-carrying slot), while the subs endpoint runs `PARALLEL=4,
-CTX_SIZE=524288, requestCount=4` on the **Q6 quant** (four 128 K slots per
-worker, scaling to a second worker only when all four are busy — an
-8-concurrency ceiling). The quant differs deliberately: KV cache is
-`slots × ctx`, so on a 48 GB A40 the Q8's ~14.6 GB usable VRAM only fits
-4 × 64 K, while the Q6 (25 GB vs 31.5 GB weights) frees ~20.6 GB and fits
-4 × 128 K — matching `slots × ctx ≤ ~592K` for this model's 34,816 B/token
-hybrid KV. The profile's `contextWindow` must match the endpoint's per-slot
-`CTX_SIZE`.
+Why the subs quant differs: KV cache is `slots × ctx`, so on a 48 GB A40 the
+Q8 (~31.5 GB weights) fits only 4 × 64 K, while the Q6 (~25 GB) frees ~20.6 GB
+and fits 4 × 128 K — matching `slots × ctx ≤ ~592K` for this model's
+34,816 B/token hybrid KV. Main runs `PARALLEL=1, CTX_SIZE=262144` on Q8; subs
+runs `PARALLEL=4, CTX_SIZE=524288, requestCount=4` — four 128 K slots per
+worker, scaling to a second worker only when all four are busy (an
+8-concurrency ceiling).
 
-**Recommended: serve the weights via Runpod's model-cache, not a baked image.**
-Keep the worker image light (runtime + llama.cpp; no model baked), and in the
-endpoint's console **Model** field set a **private Hugging Face repo that holds
-only the single quant GGUF and its mmproj**. Reason: Runpod's cache currently
-downloads *every* file in the referenced repo, so pointing it at a kitchen-sink
-quant repo (e.g. `unsloth/Qwen3.8-27B-GGUF`, ~416 GB across 30 files) is a trap —
-mirror just the two files you serve into your own repo so the cache pulls
-`GGUF + mmproj` only. Workers then boot warm from
-`/runpod-volume/huggingface-cache/hub/models--<org>--<name>/snapshots/<hash>/`
-with no per-worker re-download. Private repos are supported — the Model-field
-pull runs under Runpod's own HF access, so the profile's `apiKey` is unrelated
-(no endpoint `HF_TOKEN` is required in this setup).
+**Serve the weights via Runpod's model cache, not a baked image.** Keep the
+worker image light, and set the endpoint's console **Model** field to a
+**private Hugging Face repo holding only the single quant GGUF and its
+mmproj**. Runpod's cache downloads *every* file in the referenced repo, so a
+kitchen-sink quant repo (e.g. `unsloth/Qwen3.8-27B-GGUF`, ~416 GB across 30
+files) is a trap — mirror just the two files you serve. Workers then boot warm
+from `/runpod-volume/huggingface-cache/hub/models--<org>--<name>/snapshots/<hash>/`
+with no per-worker re-download. Private repos work: the Model-field pull runs
+under Runpod's own HF access, so no endpoint `HF_TOKEN` is required.
 
-### Schema
+</details>
 
-Every field under `model` is **required** (no model-level defaults). `request`
-and `policy` are optional and fall back to the planned defaults. `invokeUrl`
-must be an absolute `http(s)` URL; its exact spelling is preserved verbatim.
+### Retry & fallback
 
-| Field | Type / allowed values | Required | Default |
-| --- | --- | --- | --- |
-| `endpointType` | `queue` \| `load-balanced` \| `pod` | yes | — |
-| `invokeUrl` | absolute `http(s)` URL | queue/load-balanced yes; pod no | none |
-| `pod.id` | non-empty string (Runpod pod id) | endpointType `pod` | — |
-| `pod.port` | positive integer | no | `8000` |
-| `pod.inferenceApiKey` | string or `{ ref }` (see API keys) | no | none |
-| `apiKey` | string or `{ ref }` (see API keys) | no | none |
-| `model.id` | non-empty string | yes | — |
-| `model.name` | non-empty string | yes | — |
-| `model.contextWindow` | positive integer | yes | — |
-| `model.maxTokens` | positive integer | yes | — |
-| `model.reasoning` | boolean | yes | — |
-| `model.input` | non-empty array of `text` / `image` | yes | — |
-| `model.supportsTools` | boolean | yes | — |
-| `model.supportsVision` | boolean | yes | — |
-| `request.mode` | `sync` \| `async` \| `stream` | no | `sync` |
-| `request.timeoutMs` | number > 0 | no | `300000` |
-| `request.polling.intervalMs` | number > 0 | no | `1000` |
-| `request.polling.ttlMs` | number > 0 | no | `1800000` |
-| `request.polling.focusAware` | boolean | no | `true` |
-| `request.queueAdapter.kind` | `openai-shaped` \| `messages-text` \| `module` | no | `openai-shaped` |
-| `request.queueAdapter.module` | non-empty string (kind `module`) | kind `module` | — |
-| `request.queueAdapter.export` | non-empty string | no | `adapter` |
-| `request.loadBalancedPath` | non-empty string | no | `/v1/chat/completions` |
-| `policy.maxAttempts` | positive integer | no | `1` |
-| `policy.fallbackProfiles` | array of profile names | no | `[]` |
+The primary profile is attempted up to `maxAttempts` times, then each named
+fallback profile once, in order — with a 1 s backoff between attempts. Only
+**transient** failures retry or fall back (HTTP 5xx, e.g. the LB's 502 during
+a cold start, and network-level failures). Deterministic failures (4xx, job
+failures, output-shape errors) and caller aborts/timeouts surface immediately.
 
-`policy` governs dispatch resilience. The primary profile is attempted up to
-`maxAttempts` times, then each named fallback profile once, in order — with a
-1 s backoff between attempts. Only **transient** failures retry or fall back
-(HTTP 5xx responses, e.g. the LB's 502 while a worker cold-starts, and
-network-level failures); deterministic failures (4xx, job failures, output
-shape errors) and caller aborts/timeouts surface immediately. Each fallback
-profile resolves its own `apiKey` and rebuilds the request with its own model
-id — the fallback must be able to serve the same conversation (mind
-`contextWindow`: falling back from a long-context profile to a bounded one
-can overflow the smaller slot). Requests always carry `model.maxTokens` as
-the generation ceiling, so a runaway or post-abort task is bounded.
+Each fallback profile resolves its own `apiKey` and rebuilds the request with
+its own model id. It must serve the same conversation — mind `contextWindow`:
+falling from a long-context profile to a bounded one can overflow the smaller
+slot. Requests always carry `model.maxTokens` as the generation ceiling, so a
+runaway or post-abort task stays bounded.
 
-**Tool calling** is wired end-to-end: OMP's `context.tools` are forwarded as
-OpenAI function definitions, assistant history round-trips `tool_calls`, and
-worker tool calls (JSON or SSE, with fragmented `arguments` reassembled) are
-replayed as OMP tool-call events with `stopReason: "toolUse"`. A profile must
-declare `supportsTools: true` (the plugin ignores it for registration — OMP
-always passes the tool catalog — but the flag documents the capability).
+### Tool calling
 
-### API keys
-
-`apiKey` is a **reference**, never a literal-secret requirement. The parser
-accepts several forms and normalizes all of them to an unresolved reference —
-no credential bytes are ever read, stored, or echoed during configuration:
-
-- `apiKey: NAME` — an environment-variable name (resolved env-first, then as a
-  literal, OMP-custom-provider style);
-- `apiKey: env:NAME` — an explicit environment-variable reference;
-- `apiKey: "!<command>"` — a command reference run through OMP's command
-  runner; its trimmed stdout is the key;
-- `apiKey: { ref: env:NAME }` — a reference object (the canonical form the
-  command surface writes back).
-
-Resolution precedence for an actual call is: **profile `apiKey` reference →
-the OMP-provided key → `RUNPOD_API_KEY` from the environment.** A missing or
-empty `env:` reference falls through to the OMP key and then
-`RUNPOD_API_KEY`; a `!command` reference that fails or produces no output is
-an explicit error and **never** falls back. If no source yields a key, the
-call fails with a redacted error (never a credential).
-
-Every diagnostic, serialized profile, and tool result strips key material
-to a fixed `[redacted]` marker. Stream errors surface the underlying cause
-with only known credential bytes redacted (see Security model).
-
-## Provider: `runpod/<profile>`
-
-The extension registers a single provider named `runpod` and exposes one
-`ProviderModelConfig` per merged profile. A model's `id` is its **profile
-name** (not the upstream served model id), so selecting `runpod/<profile>` in
-OMP's native model picker selects that profile. All profile models share the
-plugin-owned custom API id `runpod-queue`; the provider-level API key
-reference is `RUNPOD_API_KEY` and the base URL is a placeholder OMP requires
-for registration (real per-request URLs come from each profile's
-`invokeUrl`).
+OMP's `context.tools` forward as OpenAI function definitions; assistant
+history round-trips `tool_calls`; worker tool calls (JSON or SSE, fragmented
+`arguments` reassembled) replay as OMP tool-call events with
+`stopReason: "toolUse"`. The plugin always passes OMP's tool catalog; declare
+`supportsTools: true` to document the capability.
 
 ## Endpoints
 
@@ -341,58 +311,66 @@ The transport drives Runpod's managed-queue API:
 
 | Request mode | Submission | Completion |
 | --- | --- | --- |
-| `sync` | `POST /runsync?wait=<ms>` | one-shot wait; **downgrades to status polling** if the wait (≤ 5 min) elapses before completion |
-| `async` | `POST /run` | polls `GET /status/<id>` until terminal or the profile `polling.ttlMs` elapses |
+| `sync` | `POST /runsync?wait=<ms>` | one-shot wait; **downgrades to status polling** if the wait (≤ 5 min) elapses |
+| `async` | `POST /run` | polls `GET /status/<id>` until terminal or `polling.ttlMs` elapses |
 | `stream` | `POST /run` | consumes `GET /stream/<id>` chunks; downgrades to status polling when no chunks arrive |
 
 Queue jobs report native statuses (`IN_QUEUE`, `IN_PROGRESS`, `COMPLETED`,
 `FAILED`, `CANCELLED`, `TIMED_OUT`, plus `RUNNING`/`unknown`/`expired`).
 `failed`/`cancelled`/`timed_out` jobs surface as explicit errors naming the
-job and status, with any server-provided detail.
+job, its status, and any server-provided detail.
+
+### Load-balanced (`endpointType: load-balanced`)
+
+`invokeUrl` is the endpoint's direct URL (e.g. `*.proxy.runpod.net`). One
+OpenAI-compatible HTTP call goes to `invokeUrl + request.loadBalancedPath`
+(default `/v1/chat/completions`). `request.mode` `sync` parses the JSON
+completion body; `stream` parses SSE. There is no queue to poll, so `async`
+does not apply.
 
 ### Pod (`endpointType: pod`)
 
-A pod profile targets a dedicated Runpod pod running llama.cpp. The worker's
-HTTP base is resolved at call time:
+The worker's HTTP base resolves at call time:
 
 - **TCP mode (default)** — `GET /v2/pods/<pod.id>` with the control key
-  (profile `apiKey`, else `RUNPOD_API_KEY`): the pod must be `RUNNING`, and
-  the `runtime.ports` entry for `pod.port` (falling back to the first TCP
-  entry with an ip + public pair) yields `http://<ip>:<public>`. The address
-  changes when the pod resets; it is re-derived per call, so a restart is
-  invisible to the profile. A non-running pod fails with an actionable error
-  naming the state and the `/runpod pod start` remedy.
-- **Static mode** — a configured `invokeUrl` (e.g. the HTTP proxy URL
-  `https://<pod-id>-<internal-port>.proxy.runpod.net` or a tunnel) is used
-  verbatim and no control-plane lookup happens.
+  (profile `apiKey`, else `RUNPOD_API_KEY`). The pod must be `RUNNING`; the
+  `runtime.ports` entry for `pod.port` (fallback: the first TCP entry with an
+  ip + public pair) yields `http://<ip>:<public>`. The address changes on pod
+  reset and re-derives per call, so a restart is invisible to the profile. A
+  non-running pod fails with an actionable error naming the state and the
+  `/runpod pod start` remedy.
+- **Static mode** — a configured `invokeUrl` (HTTP proxy URL
+  `https://<pod-id>-<internal-port>.proxy.runpod.net`, or a tunnel) is used
+  verbatim; no control-plane lookup happens.
 
-The HTTP call itself is the load-balanced transport, so `request.mode`
-`sync`/`stream`, tool calling, retries, and `policy.fallbackProfiles` all
-behave identically (`async` does not apply). The proxy URL form is HTTPS-only
-with a Cloudflare 100 s cap; the TCP form has no such cap, which is why it is
-the default.
+The HTTP call is the load-balanced transport, so `sync`/`stream`, tool
+calling, retries, and `policy.fallbackProfiles` behave identically (`async`
+does not apply). The proxy form is HTTPS-only with a Cloudflare 100 s cap; the
+TCP form has no such cap — hence the default.
 
 ### Health & control probes
 
-- **queue**: `GET /health` → a normalized worker summary (counts are `unknown`
-  when not reported, with a short-TTL cache).
-- **load-balanced**: `GET /ping` → HTTP 200 is `healthy`, 204 is
-  `initializing`, anything else (or a transport failure) is `unhealthy`.
-- **pod**: `GET <resolved address>/health` (with the inference token when
-  configured) → HTTP 200 is `healthy`, 204 is `initializing`, anything else
-  (or a resolution failure) is `unhealthy`. Never throws; a stopped pod reads
+- **queue** — `GET /health` → normalized worker summary (counts `unknown`
+  when unreported; short-TTL cache).
+- **load-balanced** — `GET /ping` → 200 is `healthy`, 204 is `initializing`,
+  anything else is `unhealthy`.
+- **pod** — `GET <resolved address>/health` (with the inference token when
+  configured) → 200 is `healthy`, 204 is `initializing`, anything else or a
+  resolution failure is `unhealthy`. Never throws; a stopped pod reads
   `unhealthy` with the actionable reason.
 
-### Health & control probes
+## Provider: runpod/&lt;profile&gt;
 
-- **queue**: `GET /health` → a normalized worker summary (counts are `unknown`
-  when not reported, with a short-TTL cache).
-- **load-balanced**: `GET /ping` → HTTP 200 is `healthy`, 204 is
-  `initializing`, anything else (or a transport failure) is `unhealthy`.
+One `ProviderModelConfig` per merged profile. A model's `id` is its **profile
+name** (not the upstream model id), so selecting `runpod/<profile>` selects
+that profile. All profile models share the plugin-owned custom API id
+`runpod-queue`; the provider-level key reference is `RUNPOD_API_KEY`, and the
+base URL is a placeholder OMP requires for registration — real per-request
+URLs come from each profile (`invokeUrl`, or the pod's resolved address).
 
 ## Commands
 
-One slash command namespace is registered: `/runpod`.
+One slash command namespace: `/runpod`.
 
 | Command | Behavior |
 | --- | --- |
@@ -401,71 +379,58 @@ One slash command namespace is registered: `/runpod`.
 | `/runpod profile add <name>` | Guided flow to add a profile. |
 | `/runpod profile <name>` | Persist the named profile as the default (unknown names error). |
 | `/runpod profile rm <name>` | Delete a profile after interactive confirmation. |
-| `/runpod configure` | Guided flow: choose target scope, collect fields, confirm, write the profile document atomically, reload config. |
-| `/runpod doctor` | Report global/project source paths, valid profile names, and retained validation errors. |
+| `/runpod configure` | Guided flow: target scope, fields, confirm; writes atomically, reloads config. |
+| `/runpod doctor` | Report global/project source paths, valid profile names, retained validation errors. |
 | `/runpod cancel <profile> <id>` | Cancel a queue job after interactive confirmation. |
 | `/runpod retry <profile> <id>` | Retry a queue job after interactive confirmation. |
 | `/runpod purge <profile>` | Purge pending queue jobs after interactive confirmation. |
-| `/runpod cost [profile]` | Fresh cost report: live estimate (workers × serverless price) plus actual billed amounts (last 24h + current hour). Read-only. |
+| `/runpod cost [profile]` | Fresh cost report (see [Cost](#cost)). Read-only. |
 | `/runpod pod` | List pod profiles with live control-plane states. |
-| `/runpod pod <profile>` | Full pod report: state, uptime, `$X.XX/hr`, data center, resolved HTTP address, readiness. Read-only. |
+| `/runpod pod <profile>` | Full pod report: state, uptime, `$X.XX/hr`, data center, resolved address, readiness. Read-only. |
 | `/runpod pod start <profile>` | Start the pod after interactive confirmation. |
-| `/runpod pod stop <profile>` | Stop the pod after interactive confirmation (the manual cost lever — Runpod has no native idle auto-stop). |
+| `/runpod pod stop <profile>` | Stop the pod after interactive confirmation — the manual cost lever (Runpod has no native idle auto-stop). |
 | `/runpod pod restart <profile>` | Restart the pod after interactive confirmation. |
 
-Runpod serverless is **time-billed**, so profiles carry no token prices. OMP's
-model metadata registers a zero structural cost; real cost surfaces live in the
-status line and `/runpod cost`.
+Queue-changing actions require interactive confirmation; headless sessions
+fail closed. Runpod is **time-billed**, so profiles carry no token prices;
+OMP's model metadata registers a zero structural cost.
 
-### Cost
+## Cost
 
-The session status line appends a live burn-rate estimate while a runpod
-profile is active: `Runpod profile: <name> · est $X.XX/hr`, refreshed every
-minute. `/runpod cost [profile]` (defaults to the extension default profile)
-shows the most up-to-date numbers available:
+`/runpod cost [profile]` (defaults to the extension default profile) shows
+the most current numbers:
 
 - **Live (est)** — placed workers × the GPU catalog's `price.serverless`
-  (USD/hour), plus accrued spend from each worker's uptime. Updated from the
-  live worker list; marked `(N of M workers priced)` when a worker's GPU has
-  no catalog price, and never guessed.
-- **Live (pod)** — for `endpointType: pod`, the live section comes from the
-  pod API itself: `Pod.cost` (USD/hour; 0 when the pod is stopped) with
-  accrued = rate × uptime. Rendered as `Live (pod): $X.XX/hr · ~$Y accrued
-  (state RUNNING)`; no GPU-catalog lookup is involved.
+  (USD/hour), plus accrued spend from each worker's uptime. Marked
+  `(N of M workers priced)` when a worker's GPU has no catalog price; never
+  guessed.
+- **Live (pod)** — for `endpointType: pod`, from the pod API itself:
+  `Pod.cost` (USD/hour; 0 when stopped) with accrued = rate × uptime.
+  Rendered `Live (pod): $X.XX/hr · ~$Y accrued (state RUNNING)`; no
+  GPU-catalog lookup.
 - **Billed (actual)** — per-endpoint billing history, last 24 hourly buckets
-  with the current hour's bucket called out, broken out by GPU, disk, and
-  platform fee. Pod profiles narrow the billing call with `podId`. The
-  billing API lags the live state by the platform's ~5 minute billing cycle,
-  which is why the estimate sits alongside it.
+  with the current hour called out, broken out by GPU, disk, and platform fee.
+  Pod profiles narrow the call with `podId`. The billing API lags the live
+  state by the platform's ~5 minute billing cycle, which is why the estimate
+  sits alongside it.
 
-Runpod pods are billed **per minute while running** (disk-only while
-stopped), so pod cost control is manual: stop the pod when done
-(`/runpod pod stop`, or a creation-time `stop-after` guard) — Runpod has no
-native idle-based auto-stop, and the plugin deliberately does not add one.
+Pods bill **per minute while running** (disk-only while stopped), so pod cost
+control is manual: stop the pod when done (`/runpod pod stop`, or a
+creation-time `stop-after` guard). The plugin deliberately adds no idle
+auto-stop.
 
-Cost surfaces call the Runpod REST v2 control plane (`api.runpod.io/v2`) with
-the profile's resolved API key, so the key needs control-plane/billing scope;
-a scoped-down key reports `unavailable` per section without affecting
-inference. The endpoint id is derived from `invokeUrl` (queue: last path
-segment; load-balanced: first label of `<id>.api.runpod.ai`); an
-underivable URL reports the cost sections as unavailable.
-
-### Configuration writes and live refresh
-
-When `/runpod configure` or `profile add` writes a profile document, the write
-is **atomic** (temp file + rename, no partial artifacts) and the extension
-**reloads the merged config in place**, so the command-visible profile list
-reflects the write immediately. However, making the new/edited model selectable
-in OMP's **native model picker requires an extension/session reload**: OMP
-cannot bring a newly registered native provider model live mid-session, so the
-extension intentionally does **not** re-register providers after a write. After
-changing config, **restart (or refresh) the session** so OMP reloads the runpod
-provider models. It is never claimed that config changes take effect live.
+Cost surfaces call the Runpod REST v2 control plane with the profile's
+resolved API key; the key needs control-plane/billing scope. A scoped-down
+key reports `unavailable` per section without affecting inference. The
+endpoint id derives from `invokeUrl` (queue: last path segment;
+load-balanced: first label of `<id>.api.runpod.ai`); an underivable URL
+reports cost as unavailable. The session status line is not used — OMP lacks
+an inline-segment extension API — so cost surfaces here only.
 
 ## Operational tools
 
-Models receive only read-only operational tools. Results are redacted and never
-include key material.
+Models receive read-only tools only. Results are redacted; key material never
+appears. The resolved worker address is public pod data, not a secret.
 
 | Tool | Approval | Endpoint family | Operation | Requires job id |
 | --- | --- | --- | --- | --- |
@@ -474,48 +439,43 @@ include key material.
 | `runpod_status` | read | any | `GET /status/<id>` | yes |
 | `runpod_pod` | read | pod | pod state + address + readiness | no |
 
-- Tools register only when a profile of the matching endpoint family exists.
-  `runpod_status` registers when any profile exists and reports
-  `supported: false` for targets that cannot serve it, such as a
-  load-balanced profile. `runpod_pod` registers only when at least one pod
-  profile exists; it reports state, `$X.XX/hr`, uptime, data center, the
-  resolved worker address (public pod data, not a secret), and readiness.
+Tools register only when a profile of the matching family exists.
+`runpod_status` registers when any profile exists and reports
+`supported: false` for targets that cannot serve it (e.g. load-balanced).
+`runpod_pod` registers only when at least one pod profile exists and reports
+state, `$X.XX/hr`, uptime, data center, resolved address, and readiness.
 
 ## Human queue control
 
 Queue-changing actions are slash commands, not model tools:
-
-- `/runpod cancel <profile> <id>`
-- `/runpod retry <profile> <id>`
-- `/runpod purge <profile>`
-
-Each action requires an explicit queue profile and interactive confirmation.
-Headless sessions fail closed. A model can inspect a queue, but it cannot
-cancel, retry, or purge it.
+`/runpod cancel <profile> <id>`, `/runpod retry <profile> <id>`,
+`/runpod purge <profile>`. Each requires an explicit queue profile and
+interactive confirmation; headless sessions fail closed. A model can inspect
+a queue, but cannot cancel, retry, or purge it.
 
 ## Observability
 
-The provider can journal every streamSimple turn as JSONL — the OMP-side
-half of the debugging pipeline (plugin journal ↔ shim request log ↔
-llama-server log). **Disabled by default**; enable by setting the env var:
+The provider can journal every streamSimple turn as JSONL — the OMP-side half
+of the debugging pipeline (plugin journal ↔ shim request log ↔ llama-server
+log). **Disabled by default**; enable with:
 
 ```
 RUNPOD_OMP_LOG=/path/to/runpod-provider.log.jsonl
 ```
 
-Each line records one lifecycle step: `dispatch` (request summary: message
-and tool counts, `maxTokens`, mode), `dispatch-done` (duration, text/
-reasoning/tool-call lengths, usage), `dispatch-error` (message + cause,
-credential bytes redacted), `replay-done`, and `failed` (the surfaced
-error). Unset or empty `RUNPOD_OMP_LOG` disables journaling entirely; a
-journal failure never affects the stream.
+Each line records one lifecycle step: `dispatch` (message and tool counts,
+`maxTokens`, mode), `dispatch-done` (duration, text/reasoning/tool-call
+lengths, usage), `dispatch-error` (message + cause, credential bytes
+redacted), `replay-done`, and `failed` (the surfaced error). Unset or empty
+`RUNPOD_OMP_LOG` disables journaling; a journal failure never affects the
+stream.
 
 ## Security model
 
 - Config parsing and the command surface never resolve or emit credential
   bytes; every exposed form (serialized profiles, tool results, diagnostics)
-  uses a fixed `[redacted]` marker. `!command` references that fail never
-  fall back to another key source.
+  uses a fixed `[redacted]` marker. Failing `!command` references never fall
+  back to another key source.
 - Stream failures surface the underlying transport/resolver error verbatim —
   HTTP status and server detail, timeout, abort, output-shape, unknown
   profile — so failures are actionable. Only known credential bytes (the
@@ -523,6 +483,18 @@ journal failure never affects the stream.
   original error survives as the surfaced error's `cause`.
 - Errors never carry resolved key material, command output, or a runner's
   message.
+
+## Development
+
+Requires [Bun](https://bun.sh) (`>=1.3.14`, see `package.json#engines`).
+
+```sh
+bun install
+bun test          # unit and contract tests
+bun run build     # TypeScript and declarations
+bun run smoke     # local endpoints with the real OMP CLI
+bun run verify    # test, build, and smoke
+```
 
 ## License
 
