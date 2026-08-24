@@ -1,3 +1,24 @@
+## 1.3.0
+
+- **feat:** pod profile support — TCP address derivation, lifecycle commands, pod tool, cost (`54fa4cf`)
+
+  Add `endpointType: pod` profiles for dedicated Runpod pods:
+
+  - the worker's public TCP address is resolved at call time from the control plane (`GET /v2/pods/{id}` → `runtime.ports`); a static `invokeUrl` override covers proxy/tunnel setups;
+  - `/runpod pod`, `/runpod pod <profile>`, and `/runpod pod start|stop|restart <profile>` lifecycle commands with interactive confirmation (headless sessions fail closed);
+  - `runpod_pod` read-only tool reporting state, `$X.XX/hr`, uptime, data center, resolved address, and readiness;
+  - `/runpod cost` gains a live pod section (`Pod.cost`, USD/hour; 0 when stopped) with accrued spend from uptime; billing narrows to the pod;
+  - streaming, tool calling, retries, and fallback profiles are inherited from the load-balanced transport; only `pod.inferenceApiKey` is ever forwarded to the worker — the account-scoped control key stays on the control plane.
+
+  The guided `/runpod configure` flow gained the pod endpoint type, and `/runpod profile` marks pod profiles with `(pod)`.
+
+- **docs:** reflect the Q6 subs setup — 4×128K slots, stream mode (`ad216ad`)
+
+  - subs profile: Qwen3.8-27B-UD-Q6_K_XL, contextWindow 131072
+  - both profiles on mode: stream (thinking streams; no more whole-response buffering)
+  - concurrency paragraph: PARALLEL=4, CTX_SIZE=524288, requestCount=4, 8-concurrency ceiling — with the KV-budget rationale for Q6 vs Q8 on A40
+  - model-cache note: private repos work via the Model field (no endpoint HF_TOKEN needed)
+
 ## 1.2.1
 
 - **fix:** request usage in streamed responses (`965f199`)
