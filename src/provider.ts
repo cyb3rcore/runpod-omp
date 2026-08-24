@@ -279,8 +279,15 @@ function buildNormalizedRequest(
 	// parser rejects escapes like `\d` — one such schema fails the whole
 	// request at sampler init. OMP still validates arguments locally against
 	// the original schema, so dropping them on the wire loses no safety.
-	if (context.tools !== undefined && context.tools.length > 0) {
-		request.tools = context.tools.map((tool) => ({
+	const allowed = profile.request.toolAllowlist;
+	const tools =
+		context.tools !== undefined && context.tools.length > 0
+			? allowed !== undefined && allowed.length > 0
+				? context.tools.filter((tool) => allowed.includes(tool.name))
+				: context.tools
+			: undefined;
+	if (tools !== undefined && tools.length > 0) {
+		request.tools = tools.map((tool) => ({
 			type: "function",
 			function: {
 				name: tool.name,

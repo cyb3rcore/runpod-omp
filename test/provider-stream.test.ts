@@ -846,6 +846,29 @@ describe("createRunpodStream tool calling", () => {
 		expect(mk.dispatches[0]!.request.tools).toEqual([{ type: "function", function: tool }]);
 	});
 
+	test("filters forwarded tools by request.toolAllowlist", async () => {
+		const mk = makeDeps();
+		const profile = queueProfile();
+		profile.request.toolAllowlist = ["read", "grep"];
+		const tools = [
+			{ name: "bash", description: "Run a shell command", parameters: { type: "object", properties: { command: { type: "string" } } } },
+			{ name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } } } },
+			{ name: "grep", description: "Search", parameters: { type: "object", properties: { pattern: { type: "string" } } } },
+		];
+		const context = {
+			messages: [{ role: "user", content: "x" }],
+			tools,
+		} as unknown as Context;
+
+		const stream = createRunpodStream({ [QUEUE]: profile }, mk.deps)(modelFor(QUEUE), context, FAKE_OPTIONS);
+		await stream.result();
+
+		expect(mk.dispatches[0]!.request.tools).toEqual([
+			{ type: "function", function: tools[1] },
+			{ type: "function", function: tools[2] },
+		]);
+	});
+
 	test("round-trips assistant tool calls into wire tool_calls", async () => {
 		const mk = makeDeps();
 		const context = {

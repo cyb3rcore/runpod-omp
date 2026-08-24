@@ -116,6 +116,7 @@ describe("parseProfileDocument: valid version 1 documents", () => {
 			polling: { intervalMs: 1_000, ttlMs: 1_800_000, focusAware: true },
 			queueAdapter: { kind: "openai-shaped" },
 			loadBalancedPath: "/v1/chat/completions",
+			toolAllowlist: [],
 		});
 		expect(minimal.policy).toEqual({ maxAttempts: 1, fallbackProfiles: [] });
 
@@ -128,6 +129,7 @@ describe("parseProfileDocument: valid version 1 documents", () => {
 			polling: { intervalMs: 500, ttlMs: 900_000, focusAware: false },
 			queueAdapter: { kind: "messages-text" },
 			loadBalancedPath: "/v1/completions",
+			toolAllowlist: [],
 		});
 		expect(explicit.policy).toEqual({ maxAttempts: 3, fallbackProfiles: ["minimal"] });
 		expect(explicit.apiKey).toEqual({

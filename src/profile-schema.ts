@@ -72,6 +72,8 @@ export interface ProfileRequest {
 	};
 	queueAdapter: QueueAdapterConfig;
 	loadBalancedPath: string;
+	/** Optional tool-name allowlist: when non-empty, only these OMP tools are forwarded to the worker. */
+	toolAllowlist?: string[];
 }
 
 /** Pod-targeted config for `endpointType: pod` profiles. */
@@ -638,6 +640,7 @@ function parseRequest(
 			},
 			queueAdapter: { kind: DEFAULT_QUEUE_ADAPTER_KIND },
 			loadBalancedPath: DEFAULT_LOAD_BALANCED_PATH,
+			toolAllowlist: [],
 		};
 	}
 	if (!isRecord(input)) {
@@ -736,7 +739,22 @@ function parseRequest(
 		loadBalancedPath = input.loadBalancedPath;
 	}
 
-	return { mode, timeoutMs, polling, queueAdapter, loadBalancedPath };
+	let toolAllowlist: string[] = [];
+	if (input.toolAllowlist !== undefined) {
+		if (
+			!Array.isArray(input.toolAllowlist) ||
+			!input.toolAllowlist.every((t) => typeof t === "string" && t.length > 0)
+		) {
+			errors.push({
+				sourcePath,
+				message: `profile "${name}" field "request.toolAllowlist" must be an array of non-empty strings`,
+			});
+			return null;
+		}
+		toolAllowlist = input.toolAllowlist.slice();
+	}
+
+	return { mode, timeoutMs, polling, queueAdapter, loadBalancedPath, toolAllowlist };
 }
 
 /**
