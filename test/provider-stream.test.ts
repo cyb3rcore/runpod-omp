@@ -815,6 +815,37 @@ describe("createRunpodStream tool calling", () => {
 		]);
 	});
 
+	test("keeps schema properties named pattern/format (grep's pattern must survive)", async () => {
+		const mk = makeDeps();
+		const tool = {
+			name: "grep",
+			description: "Grep file contents",
+			parameters: {
+				type: "object",
+				properties: {
+					pattern: { type: "string", description: "Regex pattern" },
+					i: { type: "string", description: "Intent" },
+					path: { type: "string" },
+					case: { type: "boolean" },
+					gitignore: { type: "boolean" },
+				},
+				required: ["pattern", "i"],
+			},
+		};
+		const context = {
+			messages: [{ role: "user", content: "search" }],
+			tools: [tool],
+		} as unknown as Context;
+
+		const stream = createRunpodStream(PROFILES, mk.deps)(modelFor(QUEUE), context, FAKE_OPTIONS);
+		await stream.result();
+
+		// The property named `pattern` is a schema object, not a regex
+		// constraint — it must reach the worker verbatim, or the model
+		// emits grep calls without the required argument.
+		expect(mk.dispatches[0]!.request.tools).toEqual([{ type: "function", function: tool }]);
+	});
+
 	test("round-trips assistant tool calls into wire tool_calls", async () => {
 		const mk = makeDeps();
 		const context = {

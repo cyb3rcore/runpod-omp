@@ -307,7 +307,12 @@ function sanitizeToolSchema(schema: unknown): unknown {
 	const record = schema as Record<string, unknown>;
 	const cleaned: Record<string, unknown> = {};
 	for (const [key, value] of Object.entries(record)) {
-		if (key === "pattern" || key === "format") {
+		// Only the JSON-Schema constraint keywords are grammar-unsafe. A
+		// property that merely shares the name — e.g. the grep tool's
+		// required `pattern` string property — is a schema object (or other
+		// non-string) and must be forwarded intact, or the model emits the
+		// call without it and OMP's local validation rejects it.
+		if ((key === "pattern" || key === "format") && typeof value === "string") {
 			continue;
 		}
 		cleaned[key] = sanitizeToolSchema(value);
