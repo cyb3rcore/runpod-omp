@@ -153,14 +153,15 @@ profiles:
 <details>
 <summary>Main + subs as pods (two profiles, one pod each)</summary>
 
-One profile per pod; the subs pod serves the Q6 quant. No `invokeUrl` — the
-plugin resolves each pod's public TCP address at call time, so restarts need
-no config change.
+One profile per pod; the subs pod serves the Q6 quant. The example mirrors
+the live subs pod deployment. No `invokeUrl` — the plugin resolves each pod's
+public TCP address at call time, so restarts need no config change.
 
 **Key separation**: `apiKey` is the control-plane key (pod API + billing);
 `pod.inferenceApiKey` (optional) is the only credential forwarded to the
-worker (llama.cpp `--api-key`). A keyless pod sends no Authorization header;
-the control key never reaches the worker, and the `RUNPOD_API_KEY` env
+worker (llama.cpp `--api-key`). The live subs pod runs keyless — no
+`pod.inferenceApiKey` — so the worker gets no Authorization header. Either
+way, the control key never reaches the worker, and the `RUNPOD_API_KEY` env
 fallback is suppressed on the inference path on purpose.
 
 Deploy the pod with its llama port exposed as a **TCP** port. If only the
@@ -193,12 +194,12 @@ profiles:
   qwen3.8-subs:
     endpointType: pod
     pod:
-      id: pod_<subs-pod-id>
-      port: 8000
-    apiKey: env:RUNPOD_API_KEY
+      id: pod_<subs-pod-id>     # the live subs pod; one profile = one pod
+      port: 8000                # internal llama.cpp port (default 8000)
+    apiKey: env:RUNPOD_API_KEY  # control-plane key (pod API); the worker runs keyless
     model:
       id: Qwen3.8-27B-UD-Q6_K_XL
-      name: Qwen3.8 27B (Runpod pod subs, Q6)
+      name: Qwen3.8 27B (Runpod subs pod, Q6)
       contextWindow: 131072
       maxTokens: 8192
       reasoning: true
@@ -208,6 +209,8 @@ profiles:
     request:
       mode: stream
       loadBalancedPath: /v1/chat/completions
+    policy:
+      maxAttempts: 3
 ```
 
 </details>
@@ -241,6 +244,8 @@ profiles:
     request:
       mode: stream
       loadBalancedPath: /v1/chat/completions
+    policy:
+      maxAttempts: 3
 
   qwen3.8-subs:
     endpointType: load-balanced
@@ -258,6 +263,8 @@ profiles:
     request:
       mode: stream
       loadBalancedPath: /v1/chat/completions
+    policy:
+      maxAttempts: 3
 ```
 
 Why the subs quant differs: KV cache is `slots × ctx`, so on a 48 GB A40 the
